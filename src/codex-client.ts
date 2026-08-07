@@ -1,0 +1,94 @@
+import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import readline from 'node:readline';
+import type { CodexThread, RpcNotification } from './types.js';
+
+type Pending = { resolve: (value: any) => void; reject: (error: Error) => void; timer: NodeJS.Timeout };
+
+export class CodexClient extends EventEmitter {
+  private child?: ChildProcessWithoutNullStreams;
+  private pending = new Map<number, Pending>();
+  private nextId = 1;
+  private starting?: Promise<void>;
+
+  constructor(private readonly bin = process.env.CODEX_BIN || 'codex') { super(); }
+
+  async start() {
+    if (this.child) return;
+    if (this.starting) return this.starting;
+    this.starting = this.launch();
+    try { await this.starting; } finally { this.starting = undefined; }
+  }
+
+  private async launch() {
+    const child = spawn(this.bin, ['app-server', '--stdio'], { stdio: ['pipe', 'pipe', 'pipe'] });
+    this.child = child;
+    readline.createInterface({ input: child.stdout }).on('line', (line) => this.onLine(line));
+    child.stderr.on('data', (data) => this.emit('log', data.toString()));
+    child.on('exit', (code) => {
+      this.child = undefined;
+      for (const item of this.pending.values()) item.reject(new Error(`Codex App Server 已退出 (${code})`));
+      this.pending.clear();
+      this.emit('offline');
+    });
+    await this.request('initialize', {
+      clientInfo: { name: 'feishu-codex-bridge', title: 'Feishu Codex Bridge', version: '0.1.0' },
+      capabilities: { experimentalApi: true, requestAttestation: false },
+    });
+    this.notify('initialized', {});
+    this.emit('online');
+  }
+
+  private onLine(line: string) {
+    let message: any;
+    try { message = JSON.parse(line); } catch { return this.emit('log', line); }
+    if (message.id !== undefined) {
+      const pending = this.pending.get(message.id);
+      if (!pending) return;
+      clearTimeout(pending.timer); this.pending.delete(message.id);
+      return message.error ? pending.reject(new Error(message.error.message ?? 'Codex 请求失败')) : pending.resolve(message.result);
+    }
+    if (message.method) this.emit('notification', message as RpcNotification);
+  }
+
+  async request(method: string, params?: unknown, timeout = 30_000): Promise<any> {
+    if (!this.child && method !== 'initialize') await this.start();
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`${method} 请求超时`)); }, timeout);
+      this.pending.set(id, { resolve, reject, timer });
+      this.child!.stdin.write(`${JSON.stringify({ method, id, params })}\n`);
+    });
+  }
+
+  notify(method: string, params?: unknown) { this.child?.stdin.write(`${JSON.stringify({ method, params })}\n`); }
+
+  async listThreads(): Promise<CodexThread[]> {
+    const all: CodexThread[] = []; let cursor: string | null = null;
+    do {
+      const result = await this.request('thread/list', { cursor, limit: 100, sortKey: 'updated_at', sortDirection: 'desc', archived: false });
+      all.push(...result.data); cursor = result.nextCursor;
+    } while (cursor);
+    return all;
+  }
+
+  async readThread(threadId: string): Promise<CodexThread> {
+    return (await this.request('thread/read', { threadId, includeTurns: true })).thread;
+  }
+
+  async send(threadId: string, text: string) {
+    return this.request('turn/start', {
+      threadId, input: [{ type: 'text', text, text_elements: [] }],
+      approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' },
+      responsesapiClientMetadata: { source: 'feishu-codex-bridge' },
+    }, 60_000);
+  }
+
+  async create(cwd: string, text: string) {
+    const started = await this.request('thread/start', { cwd, approvalPolicy: 'never', sandbox: 'danger-full-access' });
+    await this.send(started.thread.id, text);
+    return started.thread;
+  }
+
+  interrupt(threadId: string, turnId: string) { return this.request('turn/interrupt', { threadId, turnId }); }
+}
