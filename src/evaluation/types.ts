@@ -57,6 +57,7 @@ export type ActionBatch = {
   effectiveAt: ISODateTime;
   draftStatus: DraftStatus;
   sourceTopicId?: string;
+  sourceSessionId?: string;
   createdAt: ISODateTime;
   updatedAt: ISODateTime;
 };
@@ -90,6 +91,8 @@ export type EvaluationNode = {
   dueAt: ISODateTime;
   status: EvaluationNodeStatus;
   reminderStage: 0 | 1 | 3 | 7;
+  firstPromptedAt?: ISODateTime;
+  lastRemindedAt?: ISODateTime;
   feishuTaskGuid?: string;
   feishuTaskUrl?: string;
   sourceTopicId?: string;

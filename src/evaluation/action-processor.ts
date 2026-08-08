@@ -21,6 +21,7 @@ export type ActionProcessorOptions = {
     detection: StructuredDetectionResult;
     context: TurnActionContext;
   }) => Promise<void> | void;
+  allowedProjectPaths?: ReadonlySet<string>;
 };
 
 export class ActionProcessor {
@@ -29,6 +30,7 @@ export class ActionProcessor {
   private readonly collectGit: typeof collectGitEvidence;
   private readonly now: () => string;
   private readonly onCandidateSaved?: ActionProcessorOptions['onCandidateSaved'];
+  private readonly allowedProjectPaths?: ReadonlySet<string>;
   private readonly inFlight = new Set<string>();
 
   constructor(
@@ -41,6 +43,7 @@ export class ActionProcessor {
     this.collectGit = options.collectGit ?? collectGitEvidence;
     this.now = options.now ?? (() => new Date().toISOString());
     this.onCandidateSaved = options.onCandidateSaved;
+    this.allowedProjectPaths = options.allowedProjectPaths;
   }
 
   async handleNotification(notification: RpcNotification): Promise<void> {
@@ -50,11 +53,16 @@ export class ActionProcessor {
     const turnId = params?.turn?.id;
     if (!sessionId || !turnId) return;
     const eventId = `codex:turn.completed:${sessionId}:${turnId}`;
+    if (this.store.isEvaluationSession(sessionId)) return;
     if (this.store.hasProcessedEvent(eventId)) return;
     if (this.inFlight.has(eventId)) return;
     this.inFlight.add(eventId);
     try {
       const thread = await this.codex.readThread(sessionId);
+      if (this.allowedProjectPaths?.size && !this.allowedProjectPaths.has(thread.cwd)) {
+        this.store.markEventProcessed(eventId, this.now());
+        return;
+      }
       const fullTurn = thread.turns.find((turn) => turn.id === turnId);
       const notificationTurn = params?.turn as CodexTurn | undefined;
       const turn = fullTurn?.items?.length ? fullTurn : notificationTurn;

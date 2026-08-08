@@ -10,7 +10,7 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
-function setup(enabled = true) {
+function setup(enabled = true, allowedProjectPaths?: ReadonlySet<string>) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexreach-action-processor-'));
   dirs.push(dir);
   const store = new EvaluationStore(path.join(dir, 'state.sqlite'));
@@ -26,6 +26,7 @@ function setup(enabled = true) {
   }));
   const processor = new ActionProcessor({ readThread } as any, store, {
     enabled,
+    allowedProjectPaths,
     now: () => '2026-08-08T00:00:00.000Z',
     collectGit: async () => ({
       root: '/projects/site', baseCommit: 'aaa', headCommit: 'bbb', changedFiles: ['src/page.tsx'],
@@ -62,6 +63,13 @@ describe('ActionProcessor', () => {
     const { processor, readThread, store } = setup(false);
     await processor.handleNotification(notification);
     expect(readThread).not.toHaveBeenCalled();
+    store.close();
+  });
+
+  it('ignores completed turns outside the project allowlist', async () => {
+    const { processor, store } = setup(true, new Set(['/projects/other']));
+    await processor.handleNotification(notification);
+    expect(store.listActiveCandidates(Buffer.from('/projects/site').toString('base64url'))).toEqual([]);
     store.close();
   });
 });

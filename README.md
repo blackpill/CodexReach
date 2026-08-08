@@ -118,6 +118,25 @@ launchctl bootout "gui/$(id -u)/com.local.codexreach"
 rm "$HOME/Library/LaunchAgents/com.local.codexreach.plist"
 ```
 
+## 后续评估试点
+
+通用后续评估系统默认关闭。启用前，需要在飞书开放平台为应用增加任务与任务清单的读写权限，并发布新版本：
+
+- `task:task:write`
+- `task:tasklist:read`
+- `task:tasklist:write`
+
+然后配置默认负责人并开启功能：
+
+```dotenv
+EVALUATION_SYSTEM_ENABLED=true
+EVALUATION_PROJECT_PATHS=/Users/kenny/Documents/classgames.net
+EVALUATION_DEFAULT_ASSIGNEE_OPEN_ID=ou_xxx
+EVALUATION_SCHEDULER_INTERVAL_SECONDS=60
+```
+
+启用后，白名单项目中新完成的 Codex 回合会进入行动识别流程。确认部署草稿后，系统创建 7/28 天等评估节点和飞书任务；任务到期时先在原项目话题询问，确认后才创建新的 Codex 评估 Session。`EVALUATION_PROJECT_PATHS` 留空表示允许所有项目，试点阶段不建议留空。
+
 ## 安全说明
 
 服务仅用于可信局域网。务必配置 `FEISHU_ALLOWED_OPEN_IDS`。完全自动模式能读写本机文件并控制屏幕，不应在公共 Wi-Fi 使用。删除 `.data/auth.json` 并重启服务可撤销所有已配对浏览器。

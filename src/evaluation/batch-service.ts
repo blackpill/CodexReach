@@ -38,6 +38,7 @@ export class BatchService {
       effectiveAt: now,
       draftStatus: 'draft_pending',
       sourceTopicId: undefined,
+      sourceSessionId: input.context.sessionId,
       createdAt: now,
       updatedAt: now,
     };

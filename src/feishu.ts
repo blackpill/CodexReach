@@ -19,6 +19,7 @@ type TaskState = { startedAt: number; lastActivityAt: number; turnId?: string; c
 type DocumentBinding = { fileToken: string; fileType: 'doc' | 'docx'; url: string; projectPath: string; projectName: string };
 type CommentTarget = { fileToken: string; fileType: 'doc' | 'docx'; commentId: string; replyId?: string; openId: string };
 type EvaluationDraftHandler = (batchId: string, action: 'confirm' | 'ignore') => Promise<void> | void;
+type EvaluationDueHandler = (nodeId: string, action: 'start' | 'postpone' | 'cancel') => Promise<void> | void;
 
 const CODEX_REACH_LABEL = 'CodexReach';
 
@@ -62,6 +63,7 @@ export class FeishuGateway {
   private syncedTurns = new Map<string, string[]>();
   private evaluationHubTopics = new Map<string, SessionTopic>();
   private evaluationDraftHandler?: EvaluationDraftHandler;
+  private evaluationDueHandler?: EvaluationDueHandler;
   private evaluationTasklistGuid?: string;
   private evaluationTasklistPromise?: Promise<string>;
   private client?: lark.Client;
@@ -75,6 +77,10 @@ export class FeishuGateway {
 
   setEvaluationDraftHandler(handler: EvaluationDraftHandler) {
     this.evaluationDraftHandler = handler;
+  }
+
+  setEvaluationDueHandler(handler: EvaluationDueHandler) {
+    this.evaluationDueHandler = handler;
   }
 
   async sendEvaluationDraft(projectPath: string, sourceSessionId: string, draft: EvaluationDraft): Promise<boolean> {
@@ -148,6 +154,91 @@ export class FeishuGateway {
       });
     }
     return updated;
+  }
+
+  async sendEvaluationDueCard(input: {
+    projectPath: string;
+    sourceSessionId?: string;
+    projectName: string;
+    batchSummary: string;
+    template: string;
+    node: EvaluationNode;
+  }): Promise<boolean> {
+    if (!this.client) return false;
+    const group = this.projectGroups.get(input.projectPath);
+    if (!group) return false;
+    const topic = await this.resolveEvaluationTopic(this.client, group, input.sourceSessionId);
+    const content = JSON.stringify({
+      config: { wide_screen_mode: true, update_multi: true },
+      header: { template: 'blue', title: { tag: 'plain_text', content: '评估任务已到期' } },
+      elements: [
+        { tag: 'div', text: { tag: 'lark_md', content: `**项目**\n${input.projectName}\n\n**原行动**\n${input.batchSummary}\n\n**评估目标**\n${input.node.purpose}\n\n**计划时间**\n${input.node.dueAt}\n\n**类型**\n${input.template.toUpperCase()}` } },
+        { tag: 'action', actions: [
+          { tag: 'button', type: 'primary', text: { tag: 'plain_text', content: '开始评估' }, value: { action: 'evaluation_due_start', nodeId: input.node.id } },
+          { tag: 'button', text: { tag: 'plain_text', content: '延期 7 天' }, value: { action: 'evaluation_due_postpone', nodeId: input.node.id } },
+          { tag: 'button', type: 'danger', text: { tag: 'plain_text', content: '取消评估' }, value: { action: 'evaluation_due_cancel', nodeId: input.node.id } },
+        ] },
+      ],
+    });
+    const sent = await this.client.im.message.reply({ path: { message_id: topic.rootMessageId }, data: { msg_type: 'interactive', content } });
+    if (sent.code) throw new Error(`发送到期评估卡片失败：${sent.msg}`);
+    return true;
+  }
+
+  async sendEvaluationReminder(input: {
+    projectPath: string;
+    sourceSessionId?: string;
+    node: EvaluationNode;
+    stage: 1 | 3 | 7;
+  }): Promise<boolean> {
+    if (!this.client) return false;
+    const group = this.projectGroups.get(input.projectPath);
+    if (!group) return false;
+    const topic = await this.resolveEvaluationTopic(this.client, group, input.sourceSessionId);
+    const label = input.stage === 7 ? '最后一次提醒' : `第 ${input.stage} 天提醒`;
+    const sent = await this.client.im.message.reply({ path: { message_id: topic.rootMessageId }, data: {
+      msg_type: 'text', content: JSON.stringify({ text: `${label}：评估任务尚未处理\n\n${input.node.purpose}\n\n请处理上方“评估任务已到期”卡片。` }),
+    }});
+    if (sent.code) throw new Error(`发送评估提醒失败：${sent.msg}`);
+    return true;
+  }
+
+  async startEvaluationSession(input: {
+    projectPath: string;
+    sourceSessionId?: string;
+    title: string;
+    prompt: string;
+    onPrepared?: (sessionId: string, topicId: string) => Promise<void> | void;
+  }): Promise<{ sessionId: string; topicId: string }> {
+    if (!this.client) throw new Error('飞书客户端尚未初始化');
+    const group = this.projectGroups.get(input.projectPath);
+    if (!group) throw new Error(`找不到项目群：${input.projectPath}`);
+    const thread = await this.codex.prepareThread(input.projectPath, input.title);
+    const topic = await this.ensureSessionTopic(this.client, group, thread.id, input.title);
+    this.targets.set(thread.id, { chatId: group.chatId, openId: '', rootMessageId: topic.rootMessageId });
+    this.saveState();
+    await input.onPrepared?.(thread.id, topic.threadId);
+    const turn = await this.codex.send(thread.id, input.prompt);
+    if (turn?.turn?.id) this.recordBridgeTurn(thread.id, turn.turn.id);
+    return { sessionId: thread.id, topicId: topic.threadId };
+  }
+
+  async rescheduleEvaluationTask(taskGuid: string | undefined, dueAt: string) {
+    if (!this.client || !taskGuid) return;
+    const result = await this.client.task.v2.task.patch({
+      path: { task_guid: taskGuid },
+      data: { task: { due: { timestamp: String(Date.parse(dueAt)), is_all_day: false } }, update_fields: ['due'] },
+    });
+    if (result.code) throw new Error(`延期飞书评估任务失败：${result.msg}`);
+  }
+
+  async completeEvaluationTask(taskGuid: string | undefined, completedAt = new Date().toISOString()) {
+    if (!this.client || !taskGuid) return;
+    const result = await this.client.task.v2.task.patch({
+      path: { task_guid: taskGuid },
+      data: { task: { completed_at: String(Date.parse(completedAt)) }, update_fields: ['completed_at'] },
+    });
+    if (result.code) throw new Error(`完成飞书评估任务失败：${result.msg}`);
   }
 
   start() {
@@ -284,6 +375,13 @@ export class FeishuGateway {
           if (!this.evaluationDraftHandler) return toastResponse('评估系统尚未启用', 'error');
           await this.evaluationDraftHandler(value.batchId, value.action === 'evaluation_draft_confirm' ? 'confirm' : 'ignore');
           return toastResponse(value.action === 'evaluation_draft_confirm' ? '已确认评估计划草稿' : '已标记为无需评估', 'success');
+        }
+        if (['evaluation_due_start', 'evaluation_due_postpone', 'evaluation_due_cancel'].includes(value.action)) {
+          if (!this.evaluationDueHandler) return toastResponse('评估调度器尚未启用', 'error');
+          const action = value.action === 'evaluation_due_start' ? 'start' : value.action === 'evaluation_due_postpone' ? 'postpone' : 'cancel';
+          await this.evaluationDueHandler(value.nodeId, action);
+          const labels = { start: '已启动评估', postpone: '已延期 7 天', cancel: '已取消评估' };
+          return toastResponse(labels[action], 'success');
         }
       },
       'drive.notice.comment_add_v1': async (event: any) => {
@@ -851,6 +949,11 @@ export class FeishuGateway {
     this.evaluationHubTopics.set(group.projectPath, topic);
     this.saveState();
     return topic;
+  }
+
+  private async resolveEvaluationTopic(client: lark.Client, group: ProjectGroup, sourceSessionId?: string): Promise<SessionTopic> {
+    return (sourceSessionId ? this.sessionTopics.get(sourceSessionId) : undefined)
+      ?? this.ensureEvaluationHubTopic(client, group);
   }
 
   private async ensureEvaluationTasklist(client: lark.Client): Promise<string> {

@@ -305,6 +305,15 @@ export class EvaluationStore {
     return rows.map((row) => JSON.parse(row.value_json) as EvaluationNode);
   }
 
+  isEvaluationSession(sessionId: string): boolean {
+    const row = this.db.prepare(`
+      SELECT 1 FROM evaluation_nodes
+      WHERE json_extract(value_json, '$.startedSessionId') = ?
+      LIMIT 1
+    `).get(sessionId);
+    return Boolean(row);
+  }
+
   enqueue<T extends Record<string, unknown>>(event: OutboxEvent<T>): boolean {
     const result = this.db.prepare(`
       INSERT INTO evaluation_outbox(

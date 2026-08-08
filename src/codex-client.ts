@@ -113,7 +113,7 @@ export class CodexClient extends EventEmitter {
     }
   }
 
-  async create(cwd: string, text: string) {
+  async prepareThread(cwd: string, text: string) {
     const started = await this.request('thread/start', {
       cwd,
       approvalPolicy: 'never',
@@ -123,8 +123,13 @@ export class CodexClient extends EventEmitter {
     });
     const name = text.replace(/\s+/g, ' ').trim().slice(0, 50) || '飞书新任务';
     await this.request('thread/name/set', { threadId: started.thread.id, name });
-    const turn = await this.send(started.thread.id, text);
-    return { ...started.thread, startedTurnId: turn?.turn?.id };
+    return started.thread as CodexThread;
+  }
+
+  async create(cwd: string, text: string) {
+    const thread = await this.prepareThread(cwd, text);
+    const turn = await this.send(thread.id, text);
+    return { ...thread, startedTurnId: turn?.turn?.id };
   }
 
   interrupt(threadId: string, turnId: string) { return this.request('turn/interrupt', { threadId, turnId }); }
