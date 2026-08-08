@@ -76,16 +76,29 @@ export class CodexClient extends EventEmitter {
     return (await this.request('thread/read', { threadId, includeTurns: true })).thread;
   }
 
+  async resumeThread(threadId: string): Promise<CodexThread> {
+    return (await this.request('thread/resume', { threadId })).thread;
+  }
+
   async send(threadId: string, text: string) {
-    return this.request('turn/start', {
+    const params = {
       threadId, input: [{ type: 'text', text, text_elements: [] }],
       approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' },
       responsesapiClientMetadata: { source: 'feishu-codex-bridge' },
-    }, 60_000);
+    };
+    try {
+      return await this.request('turn/start', params, 60_000);
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.includes('thread not found')) throw error;
+      await this.resumeThread(threadId);
+      return this.request('turn/start', params, 60_000);
+    }
   }
 
   async create(cwd: string, text: string) {
     const started = await this.request('thread/start', { cwd, approvalPolicy: 'never', sandbox: 'danger-full-access' });
+    const name = text.replace(/\s+/g, ' ').trim().slice(0, 50) || '飞书新任务';
+    await this.request('thread/name/set', { threadId: started.thread.id, name });
     await this.send(started.thread.id, text);
     return started.thread;
   }

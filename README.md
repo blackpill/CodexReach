@@ -39,7 +39,7 @@ FEISHU_ALLOWED_OPEN_IDS=ou_xxx
 
 机器人命令：
 
-- `/projects`：列出项目
+- `/projects`：以可翻页卡片列出项目，可直接点击查看该项目的 Sessions
 - `/sessions`：列出最近 Session
 - `/use <session-id>`：选择 Session
 - `/new <绝对路径> <任务>`：创建真实 Session
