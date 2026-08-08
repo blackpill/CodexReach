@@ -7,6 +7,9 @@
 - 按工作目录展示全部 Codex Projects 和 Sessions
 - 读取完整 Session、继续发送任务、实时刷新、停止运行
 - 飞书长连接机器人，无需公网回调地址
+- 每个 Codex Project 自动对应一个飞书话题消息群
+- 每个 Codex Session 自动对应群内一个独立话题，对话历史与上下文严格隔离
+- 所有自动创建的项目群均使用 `CodexReach｜` 群名前缀作为可见标签
 - Safari 手机控制台、二维码配对、Bearer Token 校验
 - `approvalPolicy=never` 与 `dangerFullAccess` 完全自动模式
 - macOS 登录后自动启动
@@ -28,7 +31,7 @@ npm start
 
 1. 在飞书开放平台创建企业自建应用并开启机器人。
 2. 开启长连接事件订阅，订阅 `im.message.receive_v1`。
-3. 授予读取和发送消息所需权限，并发布应用版本。
+3. 授予读取和发送消息、创建群、更新应用创建的群、管理群 Label、获取群分享链接所需权限，并发布应用版本。若希望话题中无需每次 @ 机器人，还需开启“获取群组中所有消息”。
 4. 将 App ID、App Secret 和允许控制的用户 `open_id` 写入 `.env`：
 
 ```dotenv
@@ -40,12 +43,22 @@ FEISHU_ALLOWED_OPEN_IDS=ou_xxx
 机器人命令：
 
 - `/projects`：以可翻页卡片列出项目，可直接点击查看该项目的 Sessions
+- `/sync-projects`：为每个 Project 创建或同步一个带 `CodexReach｜` 前缀的话题消息群，并为已有 Session 创建独立话题
+- `/sync-project <项目名称|绝对路径|编号>`：只创建或同步指定的一个 Project
 - `/sessions`：列出最近 Session
 - `/use <session-id>`：选择 Session
 - `/new <绝对路径> <任务>`：创建真实 Session
 - `/stop`：停止当前任务
 - `/help`：查看帮助
 - 选择 Session 后，普通文字会直接作为下一轮任务发送。
+
+首次配置权限并发布应用后，在机器人单聊中发送 `/sync-projects`。之后：
+
+- Project 名称与飞书群名称保持一致；群描述记录项目绝对路径。
+- 在项目群内新建一个话题，会自动创建并绑定一个新的 Codex Session。
+- 在已有 Session 话题内发送消息，只会继续该话题绑定的 Session。
+- 已开通群消息事件权限，在 CodexReach 话题内可直接发送命令，无需 `@Bot`。
+- Bot 的执行结果始终回复到原话题，不会进入其他 Session 的消息历史。
 
 ## 自动启动
 

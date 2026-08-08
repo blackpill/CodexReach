@@ -6,10 +6,22 @@ import { groupProjects, type Project } from './types.js';
 
 type Card = { config: Record<string, unknown>; header: Record<string, unknown>; elements: Array<Record<string, unknown>> };
 type Reply = string | Card;
+type ProjectGroup = { projectPath: string; projectName: string; chatId: string; shareLink?: string };
+type SessionTopic = { sessionId: string; chatId: string; threadId: string; rootMessageId: string };
+type Target = { chatId: string; openId: string; rootMessageId?: string };
+
+const CODEX_REACH_LABEL = 'CodexReach';
+
+function projectGroupName(projectName: string) {
+  // 自建应用通常没有企业级群 Label 管理权限，因此用稳定前缀作为可见标签。
+  return `${CODEX_REACH_LABEL}｜${projectName}`.slice(0, 60);
+}
 
 export class FeishuGateway {
   private selected = new Map<string, string>();
-  private targets = new Map<string, { chatId: string; openId: string }>();
+  private targets = new Map<string, Target>();
+  private projectGroups = new Map<string, ProjectGroup>();
+  private sessionTopics = new Map<string, SessionTopic>();
   private handledMessages: string[] = [];
   private projectsCache?: { at: number; projects: Project[] };
   private readonly stateFile = path.resolve('.data/feishu-state.json');
@@ -33,13 +45,64 @@ export class FeishuGateway {
           this.saveState();
         }
         const chatId = event.message.chat_id;
+        // 部分飞书消息事件不返回 thread_id，但话题回复一定带稳定的 root_id。
+        const rawThreadId = event.message.thread_id ?? '';
+        const threadId = rawThreadId || event.message.root_id || '';
+        const rootMessageId = event.message.root_id || event.message.message_id;
         const text = JSON.parse(event.message.content).text?.trim() ?? '';
+
+        // Project 群中的一个飞书话题严格对应一个 Codex Session。
+        const projectGroup = [...this.projectGroups.values()].find((group) => group.chatId === chatId);
+        if (projectGroup && threadId) {
+          try {
+            let topic = [...this.sessionTopics.values()].find((item) => item.chatId === chatId && (
+              (rawThreadId && item.threadId === rawThreadId)
+              || item.rootMessageId === rootMessageId
+            ));
+            console.info('[feishu-route]', { chatId, rawThreadId, rootMessageId, matchedSessionId: topic?.sessionId ?? null });
+            if (!topic) {
+              const created = await this.codex.create(projectGroup.projectPath, text);
+              topic = { sessionId: created.id, chatId, threadId, rootMessageId };
+              this.sessionTopics.set(created.id, topic);
+              this.targets.set(created.id, { chatId, openId, rootMessageId });
+              this.saveState();
+              await client.im.message.reply({ path: { message_id: rootMessageId }, data: {
+                msg_type: 'text', content: JSON.stringify({ text: `Codex Session 已创建：${created.id}\n此话题内的消息只会进入该 Session。` }),
+              }});
+              return;
+            }
+            this.targets.set(topic.sessionId, { chatId, openId, rootMessageId: topic.rootMessageId });
+            this.saveState();
+            await this.codex.send(topic.sessionId, text);
+            await client.im.message.reply({ path: { message_id: rootMessageId }, data: {
+              msg_type: 'text', content: JSON.stringify({ text: `已提交到 Session：${topic.sessionId}` }),
+            }});
+          } catch (error) {
+            console.error('[feishu-submit]', error);
+            const detail = formatCodexSubmitError(error);
+            try {
+              await client.im.message.reply({ path: { message_id: rootMessageId }, data: {
+                msg_type: 'text', content: JSON.stringify({ text: `❌ 未能发送给 Codex\n\n${detail}` }),
+              }});
+            } catch (replyError) {
+              console.error('[feishu-submit-reply]', replyError);
+            }
+          }
+          return;
+        }
+        // 话题消息绝不能回退到用户最近选择的 Session，否则会造成跨话题串线。
+        if (threadId && !projectGroup) {
+          await client.im.message.reply({ path: { message_id: rootMessageId }, data: {
+            msg_type: 'text', content: JSON.stringify({ text: '此群尚未绑定 Codex Project，因此没有发送到任何 Session。\n请先在 Bot 单聊中执行 /sync-projects，并从返回的 CodexReach 项目群进入对应话题。' }),
+          }});
+          return;
+        }
         const selectedBeforeSend = this.selected.get(openId);
         if (selectedBeforeSend && !text.startsWith('/')) {
           this.targets.set(selectedBeforeSend, { chatId, openId });
           this.saveState();
         }
-        const reply = await this.handle(openId, text).catch((error) => `执行失败：${error.message}`);
+        const reply = await this.handle(openId, text, client).catch((error) => `执行失败：${formatFeishuError(error)}`);
         const selectedId = this.selected.get(openId);
         if (selectedId && (!text.startsWith('/') || text.startsWith('/new'))) {
           this.targets.set(selectedId, { chatId, openId });
@@ -82,9 +145,12 @@ export class FeishuGateway {
         const turn = notification.params?.turn;
         const summary = turn ? formatTurnStatus(threadId, turn) : formatStatus(await this.codex.readThread(threadId));
         const needsHuman = /真人|验证|captcha|security verification|手动完成/i.test(summary);
-        await client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: {
-          receive_id: target.chatId, msg_type: 'text', content: JSON.stringify({ text: `${needsHuman ? '⚠️ 需要人工处理' : '任务状态更新'}\n\n${summary}` }),
-        }});
+        const content = JSON.stringify({ text: `${needsHuman ? '⚠️ 需要人工处理' : '任务状态更新'}\n\n${summary}` });
+        if (target.rootMessageId) {
+          await client.im.message.reply({ path: { message_id: target.rootMessageId }, data: { msg_type: 'text', content } });
+        } else {
+          await client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: target.chatId, msg_type: 'text', content } });
+        }
       } catch (error) { console.error('[feishu-notify]', error); }
     });
     const ws = new lark.WSClient({ appId, appSecret, loggerLevel: lark.LoggerLevel.info });
@@ -92,11 +158,52 @@ export class FeishuGateway {
     return true;
   }
 
-  async handle(user: string, input: string): Promise<Reply> {
+  async handle(user: string, input: string, client?: lark.Client): Promise<Reply> {
     const [command, ...rest] = input.split(/\s+/);
     if (command === '/projects') {
       const projects = await this.getProjects(true);
       return projects.length ? projectCard(projects, 0) : '暂无项目';
+    }
+    if (command === '/sync-projects') {
+      if (!client) return '飞书客户端尚未初始化';
+      const projects = await this.getProjects(true);
+      if (!projects.length) return '暂无可同步的 Project';
+      const results: string[] = [];
+      for (const project of projects) {
+        const group = await this.ensureProjectGroup(client, project, user);
+        let created = 0;
+        for (const session of project.sessions) {
+          if (!this.sessionTopics.has(session.id)) {
+            await this.ensureSessionTopic(client, group, session.id, session.name || session.preview || '未命名 Session');
+            created++;
+          }
+        }
+        results.push(`• ${project.name}：${group.shareLink ? `[打开群聊](${group.shareLink})` : group.chatId}，新增 ${created} 个 Session 话题`);
+      }
+      this.saveState();
+      return `已同步 ${projects.length} 个 CodexReach Project 群：\n\n${results.join('\n')}`;
+    }
+    if (command === '/sync-project') {
+      if (!client) return '飞书客户端尚未初始化';
+      const selector = rest.join(' ').trim();
+      if (!selector) return '用法：/sync-project <项目名称|绝对路径|项目编号>\n可先发送 /projects 查看项目。';
+      const projects = await this.getProjects(true);
+      const index = Number(selector);
+      const project = Number.isInteger(index) && index > 0
+        ? projects[index - 1]
+        : projects.find((item) => item.path === selector)
+          ?? projects.find((item) => item.name.toLowerCase() === selector.toLowerCase());
+      if (!project) return `未找到 Project：${selector}\n请先发送 /projects 查看准确名称。`;
+      const group = await this.ensureProjectGroup(client, project, user);
+      let created = 0;
+      for (const session of project.sessions) {
+        if (!this.sessionTopics.has(session.id)) {
+          await this.ensureSessionTopic(client, group, session.id, session.name || session.preview || '未命名 Session');
+          created++;
+        }
+      }
+      this.saveState();
+      return `已同步 Project：${project.name}\n群聊：${group.shareLink ? `[打开 CodexReach 群](${group.shareLink})` : group.chatId}\n新增 Session 话题：${created}`;
     }
     if (command === '/sessions') {
       const projects = await this.getProjects();
@@ -133,7 +240,7 @@ export class FeishuGateway {
       const thread = await this.codex.readThread(id); const turn = [...thread.turns].reverse().find((t) => t.status === 'inProgress');
       if (!turn) return '当前没有运行中的任务'; await this.codex.interrupt(id, turn.id); return '已发送停止指令';
     }
-    if (command === '/help') return '/projects：显示项目卡片，点击即可查看 Sessions\n/sessions：最近会话（显示所属项目）\n/sessions <项目名称|绝对路径>：查看指定项目的会话\n/use <session-id>\n/status：查看当前任务状态和最新回复\n/status <session-id>：查看指定任务\n/new <绝对路径> <任务>\n/stop\n选择 Session 后直接发送文字即可继续。';
+    if (command === '/help') return '/sync-project <项目名称|绝对路径|编号>：只同步一个 Project\n/sync-projects：同步全部 Project\n/projects：显示项目卡片\n/sessions：最近会话\n/use <session-id>\n/status [session-id]\n/new <绝对路径> <任务>\n/stop\n\n在 CodexReach Project 群中新建话题，即会自动创建独立 Codex Session；话题之间不会共享上下文。';
     const id = this.selected.get(user); if (!id) return '请先发送 /sessions，再用 /use <session-id> 选择会话。';
     await this.codex.send(id, input); return `任务已提交，状态：执行中\nSession：${id}\n\n完成后会自动通知；也可发送 /status 主动查询。`;
   }
@@ -145,18 +252,61 @@ export class FeishuGateway {
     return projects;
   }
 
+  private async ensureProjectGroup(client: lark.Client, project: Project, ownerOpenId: string): Promise<ProjectGroup> {
+    const existing = this.projectGroups.get(project.path);
+    if (existing) {
+      // 每次同步都校正名称、话题消息模式和 CodexReach 标签。
+      const updated = await client.im.chat.update({ path: { chat_id: existing.chatId }, params: { user_id_type: 'open_id' }, data: {
+        name: projectGroupName(project.name), description: `CodexReach Project\n${project.path}`, group_message_type: 'thread',
+      }});
+      if (updated.code) throw new Error(`更新群「${project.name}」失败：${updated.msg}`);
+      return existing;
+    }
+    const created = await client.im.chat.create({ params: { user_id_type: 'open_id', set_bot_manager: true, uuid: `codexreach-${project.id}`.slice(0, 50) }, data: {
+      name: projectGroupName(project.name),
+      description: `CodexReach Project\n${project.path}`,
+      owner_id: ownerOpenId,
+      user_id_list: [ownerOpenId],
+      group_message_type: 'thread',
+      chat_mode: 'group',
+      chat_type: 'private',
+    }});
+    if (created.code || !created.data?.chat_id) throw new Error(`创建群「${project.name}」失败：${created.msg ?? '未返回 chat_id'}`);
+    const link = await client.im.chat.link({ path: { chat_id: created.data.chat_id }, data: { validity_period: 'permanently' } });
+    const group = { projectPath: project.path, projectName: project.name, chatId: created.data.chat_id, shareLink: link.data?.share_link };
+    this.projectGroups.set(project.path, group);
+    return group;
+  }
+
+  private async ensureSessionTopic(client: lark.Client, group: ProjectGroup, sessionId: string, title: string): Promise<SessionTopic> {
+    const existing = this.sessionTopics.get(sessionId);
+    if (existing) return existing;
+    const sent = await client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: {
+      receive_id: group.chatId,
+      msg_type: 'text',
+      content: JSON.stringify({ text: `${title}\n\nCodex Session：${sessionId}` }),
+      uuid: `codex-session-${sessionId}`.slice(0, 50),
+    }});
+    if (sent.code || !sent.data?.message_id || !sent.data.thread_id) throw new Error(`创建 Session 话题失败：${sent.msg ?? '未返回 thread_id'}`);
+    const topic = { sessionId, chatId: group.chatId, threadId: sent.data.thread_id, rootMessageId: sent.data.message_id };
+    this.sessionTopics.set(sessionId, topic);
+    return topic;
+  }
+
   private loadState() {
     try {
       const data = JSON.parse(fs.readFileSync(this.stateFile, 'utf8'));
       this.selected = new Map(data.selected ?? []);
       this.targets = new Map(data.targets ?? []);
+      this.projectGroups = new Map(data.projectGroups ?? []);
+      this.sessionTopics = new Map(data.sessionTopics ?? []);
       this.handledMessages = data.handledMessages ?? [];
     } catch { /* 首次启动 */ }
   }
 
   private saveState() {
     fs.mkdirSync(path.dirname(this.stateFile), { recursive: true });
-    fs.writeFileSync(this.stateFile, JSON.stringify({ selected: [...this.selected], targets: [...this.targets], handledMessages: this.handledMessages }));
+    fs.writeFileSync(this.stateFile, JSON.stringify({ selected: [...this.selected], targets: [...this.targets], projectGroups: [...this.projectGroups], sessionTopics: [...this.sessionTopics], handledMessages: this.handledMessages }, null, 2));
   }
 }
 
@@ -222,4 +372,24 @@ function cardResponse(data: Card) {
 
 function toastResponse(content: string, type: 'success' | 'error' = 'success') {
   return { toast: { type, content } };
+}
+
+function formatFeishuError(error: unknown): string {
+  const value = error as any;
+  const candidates = [
+    value?.response?.data,
+    value?.response?.data?.data,
+    ...(Array.isArray(value) ? value.flat(2) : []),
+  ];
+  const detail = candidates.find((item) => item && (item.msg || item.message || item.code));
+  if (detail) return `${detail.msg || detail.message || '飞书接口调用失败'}${detail.code ? `（错误码 ${detail.code}）` : ''}`;
+  return value?.message || String(error);
+}
+
+function formatCodexSubmitError(error: unknown): string {
+  const detail = formatFeishuError(error);
+  if (/already has an active writer/i.test(detail)) {
+    return '该 Session 正被另一个 Codex 客户端占用，暂时无法写入。请关闭正在占用此 Session 的 Codex 任务后重试。';
+  }
+  return `错误详情：${detail}\n请稍后重试；若持续失败，请检查桥接服务日志。`;
 }
