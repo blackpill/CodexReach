@@ -125,6 +125,7 @@ rm "$HOME/Library/LaunchAgents/com.local.codexreach.plist"
 - `task:task:write`
 - `task:tasklist:read`
 - `task:tasklist:write`
+- Base 表格与记录的读写权限（例如 `bitable:app`）
 
 然后配置默认负责人并开启功能：
 
@@ -133,9 +134,16 @@ EVALUATION_SYSTEM_ENABLED=true
 EVALUATION_PROJECT_PATHS=/Users/kenny/Documents/classgames.net
 EVALUATION_DEFAULT_ASSIGNEE_OPEN_ID=ou_xxx
 EVALUATION_SCHEDULER_INTERVAL_SECONDS=60
+EVALUATION_BASE_TOKEN=<当前项目进展 Base Token>
+EVALUATION_BASE_PROJECT_TABLE_ID=<项目清单 table_id>
+EVALUATION_BASE_ACTION_TABLE_ID=<行动记录 table_id>
+EVALUATION_BASE_PLAN_TABLE_ID=<评估计划 table_id>
+EVALUATION_BASE_RESULT_TABLE_ID=<评估结果 table_id>
 ```
 
 启用后，白名单项目中新完成的 Codex 回合会进入行动识别流程。确认部署草稿后，系统创建 7/28 天等评估节点和飞书任务；任务到期时先在原项目话题询问，确认后才创建新的 Codex 评估 Session。`EVALUATION_PROJECT_PATHS` 留空表示允许所有项目，试点阶段不建议留空。
+
+评估台账使用三张表：`行动记录`、`评估计划`、`评估结果`。本地 SQLite 保存每个实体对应的 Base `record_id`，因此网络重试或按钮重复点击只会更新原记录，不会重复新增。按月复制项目进展 Base 时，需要同步更新上述 Base Token 和 table ID 配置。
 
 ## 安全说明
 

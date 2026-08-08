@@ -118,6 +118,14 @@ export class EvaluationStore {
       );
       CREATE INDEX IF NOT EXISTS evaluation_runs_node_idx ON evaluation_runs(node_id, started_at);
       CREATE UNIQUE INDEX IF NOT EXISTS evaluation_runs_session_idx ON evaluation_runs(session_id);
+
+      CREATE TABLE IF NOT EXISTS evaluation_base_records (
+        entity_type TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        record_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(entity_type, entity_id)
+      );
       CREATE INDEX IF NOT EXISTS evaluation_outbox_delivery_idx
         ON evaluation_outbox(status, next_retry_at);
     `);
@@ -356,6 +364,23 @@ export class EvaluationStore {
   getRunBySession(sessionId: string): EvaluationRun | undefined {
     const row = this.db.prepare('SELECT value_json FROM evaluation_runs WHERE session_id = ?').get(sessionId) as JsonRow | undefined;
     return row ? JSON.parse(row.value_json) as EvaluationRun : undefined;
+  }
+
+  getBaseRecordId(entityType: string, entityId: string): string | undefined {
+    const row = this.db.prepare(`
+      SELECT record_id FROM evaluation_base_records WHERE entity_type = ? AND entity_id = ?
+    `).get(entityType, entityId) as { record_id: string } | undefined;
+    return row?.record_id;
+  }
+
+  saveBaseRecordId(entityType: string, entityId: string, recordId: string, updatedAt = new Date().toISOString()) {
+    this.db.prepare(`
+      INSERT INTO evaluation_base_records(entity_type, entity_id, record_id, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+        record_id = excluded.record_id,
+        updated_at = excluded.updated_at
+    `).run(entityType, entityId, recordId, updatedAt);
   }
 
   enqueue<T extends Record<string, unknown>>(event: OutboxEvent<T>): boolean {

@@ -16,6 +16,7 @@ export type EvaluationSchedulerOptions = {
   now?: () => string;
   onDue: (context: EvaluationScheduleContext) => Promise<boolean>;
   onReminder: (context: EvaluationScheduleContext, stage: 1 | 3 | 7) => Promise<boolean>;
+  onStateChanged?: (context: EvaluationScheduleContext) => Promise<void> | void;
 };
 
 export class EvaluationScheduler {
@@ -70,7 +71,9 @@ export class EvaluationScheduler {
     if (!context) return;
     try {
       if (!await this.options.onDue(context)) return;
-      this.store.saveNode({ ...node, status: 'waiting_confirmation', firstPromptedAt: now, lastRemindedAt: now, reminderStage: 0, updatedAt: now });
+      const updated = { ...node, status: 'waiting_confirmation' as const, firstPromptedAt: now, lastRemindedAt: now, reminderStage: 0 as const, updatedAt: now };
+      this.store.saveNode(updated);
+      await this.options.onStateChanged?.({ ...context, node: updated });
     } catch (error) {
       logger.error('evaluation_due_delivery_failed', error, { nodeId: node.id });
     }
@@ -85,7 +88,9 @@ export class EvaluationScheduler {
     if (!context) return;
     try {
       if (!await this.options.onReminder(context, stage)) return;
-      this.store.saveNode({ ...node, reminderStage: stage, lastRemindedAt: now, updatedAt: now });
+      const updated = { ...node, reminderStage: stage, lastRemindedAt: now, updatedAt: now };
+      this.store.saveNode(updated);
+      await this.options.onStateChanged?.({ ...context, node: updated });
     } catch (error) {
       logger.error('evaluation_reminder_delivery_failed', error, { nodeId: node.id, stage });
     }

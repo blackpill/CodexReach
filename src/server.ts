@@ -4,6 +4,7 @@ import fastifyStatic from '@fastify/static';
 import path from 'node:path';
 import os from 'node:os';
 import QRCode from 'qrcode';
+import * as lark from '@larksuiteoapi/node-sdk';
 import { CodexClient } from './codex-client.js';
 import { AuthStore } from './auth.js';
 import { FeishuGateway } from './feishu.js';
@@ -15,6 +16,7 @@ import { BatchService } from './evaluation/batch-service.js';
 import { PlanService } from './evaluation/plan-service.js';
 import { EvaluationScheduler } from './evaluation/scheduler.js';
 import { EvaluationResultProcessor } from './evaluation/result-processor.js';
+import { BaseSyncService, LarkEvaluationBaseApi } from './evaluation/base-sync.js';
 
 try { process.loadEnvFile(); } catch { /* .env 可选 */ }
 
@@ -30,6 +32,38 @@ const evaluationBatchService = new BatchService(evaluationStore);
 const evaluationPlanService = new PlanService(evaluationStore);
 const evaluationProjectPaths = new Set((process.env.EVALUATION_PROJECT_PATHS ?? '').split(',').map((item) => item.trim()).filter(Boolean));
 const feishu = new FeishuGateway(codex);
+const evaluationBaseConfig = process.env.EVALUATION_BASE_TOKEN
+  && process.env.EVALUATION_BASE_PROJECT_TABLE_ID
+  && process.env.EVALUATION_BASE_ACTION_TABLE_ID
+  && process.env.EVALUATION_BASE_PLAN_TABLE_ID
+  && process.env.EVALUATION_BASE_RESULT_TABLE_ID
+  && process.env.FEISHU_APP_ID
+  && process.env.FEISHU_APP_SECRET
+  ? {
+      baseToken: process.env.EVALUATION_BASE_TOKEN,
+      projectTableId: process.env.EVALUATION_BASE_PROJECT_TABLE_ID,
+      actionTableId: process.env.EVALUATION_BASE_ACTION_TABLE_ID,
+      planTableId: process.env.EVALUATION_BASE_PLAN_TABLE_ID,
+      resultTableId: process.env.EVALUATION_BASE_RESULT_TABLE_ID,
+    }
+  : undefined;
+const evaluationBaseSync = evaluationBaseConfig
+  ? new BaseSyncService(
+      evaluationStore,
+      new LarkEvaluationBaseApi(new lark.Client({ appId: process.env.FEISHU_APP_ID!, appSecret: process.env.FEISHU_APP_SECRET! }), evaluationBaseConfig.baseToken),
+      evaluationBaseConfig,
+    )
+  : undefined;
+
+async function syncPlanToBase(batchId: string) {
+  if (!evaluationBaseSync) return;
+  const batch = evaluationStore.getBatch(batchId);
+  const candidate = batch?.candidateIds.map((id) => evaluationStore.getCandidate(id)).find(Boolean);
+  const plan = batch ? evaluationStore.getPlanByBatch(batch.id) : undefined;
+  if (!batch || !candidate || !plan) return;
+  await evaluationBaseSync.syncPlan({ batch, candidate, plan, nodes: evaluationStore.listNodesByPlan(plan.id) });
+}
+
 feishu.setEvaluationDraftHandler(async (batchId, action) => {
   const batch = evaluationBatchService.updateDraftStatus(batchId, action === 'confirm' ? 'confirmed' : 'ignored');
   if (action === 'confirm') {
@@ -41,6 +75,7 @@ feishu.setEvaluationDraftHandler(async (batchId, action) => {
       nodes: planned.nodes,
     });
     for (const node of taskNodes) evaluationStore.saveNode(node);
+    await syncPlanToBase(batchId);
   }
   logger.info('evaluation_draft_action', { batchId, action });
 });
@@ -54,12 +89,14 @@ feishu.setEvaluationDueHandler(async (nodeId, action) => {
     const scheduled = { ...node, status: 'scheduled' as const, dueAt, reminderStage: 0 as const, firstPromptedAt: undefined, lastRemindedAt: undefined, updatedAt: now };
     evaluationStore.saveNode(scheduled);
     await feishu.rescheduleEvaluationTask(node.feishuTaskGuid, dueAt);
+    await syncPlanToBase(evaluationStore.getPlan(node.planId)?.batchId ?? '');
     return;
   }
   if (action === 'cancel') {
     const now = new Date().toISOString();
     evaluationStore.saveNode({ ...node, status: 'cancelled', updatedAt: now });
     await feishu.completeEvaluationTask(node.feishuTaskGuid, now);
+    await syncPlanToBase(evaluationStore.getPlan(node.planId)?.batchId ?? '');
     return;
   }
   if (node.status === 'running' && node.startedSessionId) return;
@@ -93,8 +130,9 @@ feishu.setEvaluationDueHandler(async (nodeId, action) => {
       sourceSessionId: batch.sourceSessionId,
       title: `评估｜${batch.projectName ?? path.basename(batch.projectPath)}｜${plan.template.toUpperCase()}`,
       prompt,
-      onPrepared: (sessionId, topicId) => {
+      onPrepared: async (sessionId, topicId) => {
         evaluationStore.saveNode({ ...node, status: 'running', startedSessionId: sessionId, evaluationTopicId: topicId, updatedAt: new Date().toISOString() });
+        await syncPlanToBase(batch.id);
       },
     });
   } catch (error) {
@@ -140,11 +178,15 @@ const evaluationScheduler = new EvaluationScheduler(evaluationStore, {
     node,
     stage,
   }),
+  onStateChanged: ({ batch }) => syncPlanToBase(batch.id),
 });
 const evaluationResultProcessor = new EvaluationResultProcessor(codex, evaluationStore, {
   enabled: process.env.EVALUATION_SYSTEM_ENABLED === 'true',
   onCompleted: async ({ node, batch, result }) => {
     if (!batch.projectPath) throw new Error(`Evaluation project path missing: ${batch.id}`);
+    const run = evaluationStore.getRunBySession(node.startedSessionId ?? '');
+    const plan = evaluationStore.getPlan(node.planId);
+    if (evaluationBaseSync && run && plan) await evaluationBaseSync.syncResult({ batch, plan, node, run, result });
     await feishu.sendEvaluationResult({
       projectPath: batch.projectPath,
       sourceSessionId: batch.sourceSessionId,
