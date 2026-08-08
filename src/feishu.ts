@@ -3,12 +3,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { CodexClient } from './codex-client.js';
 import { groupProjects, type Project } from './types.js';
+import { logger } from './logger.js';
 
 type Card = { config: Record<string, unknown>; header: Record<string, unknown>; elements: Array<Record<string, unknown>> };
 type Reply = string | Card;
 type ProjectGroup = { projectPath: string; projectName: string; chatId: string; shareLink?: string };
 type SessionTopic = { sessionId: string; chatId: string; threadId: string; rootMessageId: string };
 type Target = { chatId: string; openId: string; rootMessageId?: string };
+type QueuedMessage = { text: string; target: Target; at: number };
+type TaskState = { startedAt: number; lastActivityAt: number; turnId?: string; cardMessageId?: string; status: 'queued' | 'running' | 'completed' | 'failed' | 'stopped' | 'timeout'; detail?: string; lastPrompt?: string };
 
 const CODEX_REACH_LABEL = 'CodexReach';
 
@@ -24,6 +27,10 @@ export class FeishuGateway {
   private sessionTopics = new Map<string, SessionTopic>();
   private handledMessages: string[] = [];
   private projectsCache?: { at: number; projects: Project[] };
+  private queues = new Map<string, QueuedMessage[]>();
+  private tasks = new Map<string, TaskState>();
+  private client?: lark.Client;
+  private watchdog?: NodeJS.Timeout;
   private readonly stateFile = path.resolve('.data/feishu-state.json');
   constructor(private codex: CodexClient) { this.loadState(); }
 
@@ -32,11 +39,12 @@ export class FeishuGateway {
     if (!appId || !appSecret) return false;
     const allowed = new Set((process.env.FEISHU_ALLOWED_OPEN_IDS ?? '').split(',').filter(Boolean));
     const client = new lark.Client({ appId, appSecret });
+    this.client = client;
     const dispatcher = new lark.EventDispatcher({}).register({
       'im.message.receive_v1': async (event: any) => {
         const openId = event.sender?.sender_id?.open_id ?? '';
         if (allowed.size && !allowed.has(openId)) return;
-        if (event.message?.message_type !== 'text') return;
+        const messageType = event.message?.message_type ?? 'text';
         const messageId = event.message.message_id ?? '';
         if (messageId && this.handledMessages.includes(messageId)) return;
         if (messageId) {
@@ -49,7 +57,8 @@ export class FeishuGateway {
         const rawThreadId = event.message.thread_id ?? '';
         const threadId = rawThreadId || event.message.root_id || '';
         const rootMessageId = event.message.root_id || event.message.message_id;
-        const text = JSON.parse(event.message.content).text?.trim() ?? '';
+        const text = await this.parseIncomingMessage(client, event.message, messageType);
+        if (!text) return;
 
         // Project 群中的一个飞书话题严格对应一个 Codex Session。
         const projectGroup = [...this.projectGroups.values()].find((group) => group.chatId === chatId);
@@ -66,17 +75,13 @@ export class FeishuGateway {
               this.sessionTopics.set(created.id, topic);
               this.targets.set(created.id, { chatId, openId, rootMessageId });
               this.saveState();
-              await client.im.message.reply({ path: { message_id: rootMessageId }, data: {
-                msg_type: 'text', content: JSON.stringify({ text: `Codex Session 已创建：${created.id}\n此话题内的消息只会进入该 Session。` }),
-              }});
+              this.tasks.set(created.id, { startedAt: Date.now(), lastActivityAt: Date.now(), status: 'running', lastPrompt: text });
+              await this.sendTaskCard(created.id, { chatId, openId, rootMessageId }, 'running');
               return;
             }
             this.targets.set(topic.sessionId, { chatId, openId, rootMessageId: topic.rootMessageId });
             this.saveState();
-            await this.codex.send(topic.sessionId, text);
-            await client.im.message.reply({ path: { message_id: rootMessageId }, data: {
-              msg_type: 'text', content: JSON.stringify({ text: `已提交到 Session：${topic.sessionId}` }),
-            }});
+            await this.enqueue(topic.sessionId, text, { chatId, openId, rootMessageId: topic.rootMessageId }, true);
           } catch (error) {
             console.error('[feishu-submit]', error);
             const detail = formatCodexSubmitError(error);
@@ -108,11 +113,15 @@ export class FeishuGateway {
           this.targets.set(selectedId, { chatId, openId });
           this.saveState();
         }
-        await client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: {
+        const sentReply = await client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: {
           receive_id: chatId,
           msg_type: typeof reply === 'string' ? 'text' : 'interactive',
           content: JSON.stringify(typeof reply === 'string' ? { text: reply } : reply),
         }});
+        if (typeof reply !== 'string' && selectedId) {
+          const state = this.tasks.get(selectedId);
+          if (state && (sentReply as any).data?.message_id) state.cardMessageId = (sentReply as any).data.message_id;
+        }
       },
       'card.action.trigger': async (event: any) => {
         const openId = event.operator?.open_id ?? event.open_id ?? '';
@@ -134,11 +143,36 @@ export class FeishuGateway {
           this.saveState();
           return toastResponse(`已选择 Session：${value.sessionId}`, 'success');
         }
+        if (value.action === 'task_stop') {
+          await this.stopTask(value.sessionId);
+          return toastResponse('已发送停止指令', 'success');
+        }
+        if (value.action === 'task_refresh') {
+          return cardResponse(await this.taskCard(value.sessionId));
+        }
+        if (value.action === 'task_retry') {
+          const state = this.tasks.get(value.sessionId);
+          if (!state?.lastPrompt) return toastResponse('没有可重试的任务', 'error');
+          const target = this.targets.get(value.sessionId);
+          if (!target) return toastResponse('找不到回复目标', 'error');
+          await this.enqueue(value.sessionId, state.lastPrompt, target, false);
+          return toastResponse('已加入执行队列', 'success');
+        }
       },
     });
     this.codex.on('notification', async (notification: any) => {
-      if (notification.method !== 'turn/completed') return;
       const threadId = notification.params?.threadId ?? notification.params?.thread?.id;
+      if (threadId) {
+        const state = this.tasks.get(threadId);
+        if (state) {
+          state.lastActivityAt = Date.now();
+          state.turnId = notification.params?.turn?.id ?? state.turnId;
+          state.detail = summarizeNotification(notification);
+          if (notification.method === 'turn/completed') state.status = notification.params?.turn?.status === 'failed' ? 'failed' : notification.params?.turn?.status === 'interrupted' ? 'stopped' : 'completed';
+          await this.updateTaskCard(threadId).catch((error) => logger.error('card_update_failed', error, { threadId }));
+        }
+      }
+      if (notification.method !== 'turn/completed') return;
       const target = threadId ? this.targets.get(threadId) : undefined;
       if (!target) return;
       try {
@@ -152,9 +186,11 @@ export class FeishuGateway {
           await client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: target.chatId, msg_type: 'text', content } });
         }
       } catch (error) { console.error('[feishu-notify]', error); }
+      await this.runNext(threadId);
     });
     const ws = new lark.WSClient({ appId, appSecret, loggerLevel: lark.LoggerLevel.info });
     void ws.start({ eventDispatcher: dispatcher });
+    this.watchdog = setInterval(() => void this.checkIdleTasks(), 30_000);
     return true;
   }
 
@@ -223,26 +259,166 @@ export class FeishuGateway {
     if (command === '/use') { const id = rest[0]; if (!id) return '用法：/use <session-id>'; await this.codex.resumeThread(id); this.selected.set(user, id); this.saveState(); return `已选择 Session：${id}`; }
     if (command === '/status' || command === '/result') {
       const id = rest[0] ?? this.selected.get(user);
-      if (!id) return '请先用 /use 选择 Session，或发送 /status <session-id>。';
-      return formatStatus(await this.codex.readThread(id));
+      if (!id) {
+        const health = await this.codex.health();
+        return `桥接状态：${health.online ? '正常' : '异常'}\nCodex：${health.online ? `在线（${health.latencyMs}ms）` : health.error}\n运行任务：${[...this.tasks.values()].filter((x) => x.status === 'running').length}\n排队消息：${[...this.queues.values()].reduce((n, q) => n + q.length, 0)}`;
+      }
+      return this.taskCard(id);
     }
+    if (command === '/doctor') return this.doctor();
     if (command === '/new') {
       const raw = input.slice('/new'.length).trim();
       const quoted = raw.match(/^"([^"]+)"\s+(.+)$/s);
       const [cwd, prompt] = quoted ? [quoted[1], quoted[2]] : [rest[0], rest.slice(1).join(' ')];
       if (!cwd || !prompt) return '用法：/new <绝对路径> <任务>；路径含空格时请使用双引号。';
       const thread = await this.codex.create(cwd, prompt);
-      this.selected.set(user, thread.id); this.saveState();
-      return `已创建并开始执行：${thread.id}`;
+      this.selected.set(user, thread.id); this.tasks.set(thread.id, { startedAt: Date.now(), lastActivityAt: Date.now(), status: 'running', lastPrompt: prompt }); this.saveState();
+      return this.taskCard(thread.id);
     }
-    if (command === '/stop') {
-      const id = this.selected.get(user); if (!id) return '请先用 /use 选择 Session';
-      const thread = await this.codex.readThread(id); const turn = [...thread.turns].reverse().find((t) => t.status === 'inProgress');
-      if (!turn) return '当前没有运行中的任务'; await this.codex.interrupt(id, turn.id); return '已发送停止指令';
-    }
-    if (command === '/help') return '/sync-project <项目名称|绝对路径|编号>：只同步一个 Project\n/sync-projects：同步全部 Project\n/projects：显示项目卡片\n/sessions：最近会话\n/use <session-id>\n/status [session-id]\n/new <绝对路径> <任务>\n/stop\n\n在 CodexReach Project 群中新建话题，即会自动创建独立 Codex Session；话题之间不会共享上下文。';
+    if (command === '/stop') { const id = this.selected.get(user); if (!id) return '请先用 /use 选择 Session'; await this.stopTask(id); return '已发送停止指令'; }
+    if (command === '/help') return '/sync-project <项目名称|绝对路径|编号>：只同步一个 Project\n/sync-projects：同步全部 Project\n/projects：显示项目卡片\n/sessions：最近会话\n/use <session-id>\n/status [session-id]\n/doctor：运行诊断\n/new <绝对路径> <任务>\n/stop\n\n支持直接发送图片和文件；运行中的补充消息会自动排队。';
     const id = this.selected.get(user); if (!id) return '请先发送 /sessions，再用 /use <session-id> 选择会话。';
-    await this.codex.send(id, input); return `任务已提交，状态：执行中\nSession：${id}\n\n完成后会自动通知；也可发送 /status 主动查询。`;
+    const target = this.targets.get(id) ?? { chatId: '', openId: user };
+    await this.enqueue(id, input, target, false); return this.taskCard(id);
+  }
+
+  private async enqueue(sessionId: string, text: string, target: Target, createCard = true) {
+    this.targets.set(sessionId, target);
+    const current = this.tasks.get(sessionId);
+    if (current?.status === 'running') {
+      const queue = this.queues.get(sessionId) ?? [];
+      const last = queue.at(-1);
+      if (last && Date.now() - last.at < 1_500) last.text += `\n${text}`;
+      else queue.push({ text, target, at: Date.now() });
+      this.queues.set(sessionId, queue);
+      logger.info('message_queued', { sessionId, queueLength: queue.length });
+      await this.updateTaskCard(sessionId);
+      return;
+    }
+    const state: TaskState = { startedAt: Date.now(), lastActivityAt: Date.now(), status: 'running', lastPrompt: text };
+    this.tasks.set(sessionId, state);
+    await this.codex.send(sessionId, text);
+    if (createCard) await this.sendTaskCard(sessionId, target, 'running');
+  }
+
+  private async runNext(sessionId?: string) {
+    if (!sessionId) return;
+    const queue = this.queues.get(sessionId);
+    if (!queue?.length) return;
+    const next = queue.shift()!;
+    if (!queue.length) this.queues.delete(sessionId);
+    const state: TaskState = { startedAt: Date.now(), lastActivityAt: Date.now(), status: 'running', lastPrompt: next.text, cardMessageId: this.tasks.get(sessionId)?.cardMessageId };
+    this.tasks.set(sessionId, state);
+    try { await this.codex.send(sessionId, next.text); await this.updateTaskCard(sessionId); }
+    catch (error) { state.status = 'failed'; state.detail = formatCodexSubmitError(error); await this.updateTaskCard(sessionId); }
+  }
+
+  private async stopTask(sessionId: string) {
+    const thread = await this.codex.readThread(sessionId);
+    const turn = [...thread.turns].reverse().find((item) => item.status === 'inProgress');
+    if (!turn) throw new Error('当前没有运行中的任务');
+    await this.codex.interrupt(sessionId, turn.id);
+    const state = this.tasks.get(sessionId); if (state) state.status = 'stopped';
+    this.queues.delete(sessionId);
+    await this.updateTaskCard(sessionId);
+  }
+
+  private async sendTaskCard(sessionId: string, target: Target, _status: TaskState['status']) {
+    if (!this.client || !target.chatId) return;
+    const content = JSON.stringify(await this.taskCard(sessionId));
+    const result = target.rootMessageId
+      ? await this.client.im.message.reply({ path: { message_id: target.rootMessageId }, data: { msg_type: 'interactive', content } })
+      : await this.client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: target.chatId, msg_type: 'interactive', content } });
+    const messageId = (result as any).data?.message_id;
+    const state = this.tasks.get(sessionId); if (state && messageId) state.cardMessageId = messageId;
+  }
+
+  private async updateTaskCard(sessionId: string) {
+    const state = this.tasks.get(sessionId);
+    if (!state?.cardMessageId || !this.client) return;
+    await (this.client.im.message as any).patch({ path: { message_id: state.cardMessageId }, data: { content: JSON.stringify(await this.taskCard(sessionId)) } });
+  }
+
+  private async taskCard(sessionId: string): Promise<Card> {
+    const state = this.tasks.get(sessionId);
+    let detail = state?.detail;
+    if (!detail) try { detail = formatStatus(await this.codex.readThread(sessionId)); } catch { detail = '正在读取任务状态…'; }
+    const status = state?.status ?? 'completed';
+    const labels: Record<string, string> = { queued: '排队中', running: '执行中', completed: '已完成', failed: '失败', stopped: '已停止', timeout: '已超时' };
+    const queued = this.queues.get(sessionId)?.length ?? 0;
+    const elapsed = state ? Math.max(0, Math.round((Date.now() - state.startedAt) / 1000)) : 0;
+    const actions: Array<Record<string, unknown>> = [
+      { tag: 'button', text: { tag: 'plain_text', content: '刷新' }, value: { action: 'task_refresh', sessionId } },
+    ];
+    if (status === 'running') actions.unshift({ tag: 'button', type: 'danger', text: { tag: 'plain_text', content: '停止' }, value: { action: 'task_stop', sessionId } });
+    if (status === 'failed' || status === 'timeout') actions.unshift({ tag: 'button', type: 'primary', text: { tag: 'plain_text', content: '重试' }, value: { action: 'task_retry', sessionId } });
+    return { config: { wide_screen_mode: true, update_multi: true }, header: { template: status === 'failed' || status === 'timeout' ? 'red' : status === 'completed' ? 'green' : 'blue', title: { tag: 'plain_text', content: `Codex · ${labels[status] ?? status}` } }, elements: [
+      { tag: 'div', text: { tag: 'lark_md', content: `**Session**\n${sessionId}\n\n**运行时间** ${elapsed}s　**队列** ${queued}` } },
+      { tag: 'div', text: { tag: 'lark_md', content: String(detail).slice(0, 3000) } },
+      { tag: 'action', actions },
+    ] };
+  }
+
+  private async doctor(): Promise<string> {
+    const health = await this.codex.health();
+    const checks = [
+      `Codex App Server：${health.online ? `正常（${health.latencyMs}ms）` : `异常：${health.error}`}`,
+      `飞书长连接：${this.client ? '已初始化' : '未初始化'}`,
+      `状态目录：${fs.existsSync(path.dirname(this.stateFile)) ? '可用' : '尚未创建'}`,
+      `附件目录：${this.ensureMediaDir()}`,
+      `运行任务：${[...this.tasks.values()].filter((x) => x.status === 'running').length}`,
+      `排队消息：${[...this.queues.values()].reduce((n, q) => n + q.length, 0)}`,
+    ];
+    logger.info('doctor', { online: health.online });
+    return `诊断结果（不含凭据）\n\n${checks.map((x) => `• ${x}`).join('\n')}`;
+  }
+
+  private async checkIdleTasks() {
+    const timeoutMs = Number(process.env.FEISHU_IDLE_TIMEOUT_MINUTES ?? 15) * 60_000;
+    if (!timeoutMs) return;
+    for (const [sessionId, state] of this.tasks) {
+      if (state.status !== 'running' || Date.now() - state.lastActivityAt < timeoutMs) continue;
+      state.status = 'timeout'; state.detail = `超过 ${Math.round(timeoutMs / 60_000)} 分钟没有新事件，已自动停止。`;
+      try { await this.stopTask(sessionId); state.status = 'timeout'; } catch { /* turn may already be done */ }
+      await this.updateTaskCard(sessionId).catch(() => undefined);
+      logger.warn('task_idle_timeout', { sessionId });
+    }
+  }
+
+  private ensureMediaDir() {
+    const dir = path.resolve('.data/media');
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  private async parseIncomingMessage(client: lark.Client, message: any, messageType: string): Promise<string> {
+    let content: any = {};
+    try { content = JSON.parse(message.content ?? '{}'); } catch { return ''; }
+    if (messageType === 'text') return content.text?.trim() ?? '';
+    const key = content.file_key ?? content.image_key;
+    if (!key || !['file', 'image', 'audio', 'media'].includes(messageType)) return '';
+    const safeName = path.basename(content.file_name || `${messageType}-${Date.now()}${messageType === 'image' ? '.png' : ''}`).replace(/[^\p{L}\p{N}._-]+/gu, '_');
+    const sessionDir = path.join(this.ensureMediaDir(), String(message.chat_id || 'unknown'));
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const destination = path.join(sessionDir, `${Date.now()}-${safeName}`);
+    try {
+      const api: any = (client.im as any).messageResource;
+      const response = await api.get({ path: { message_id: message.message_id, file_key: key }, params: { type: messageType === 'image' ? 'image' : 'file' } });
+      const payload = response?.data ?? response;
+      if (Buffer.isBuffer(payload)) fs.writeFileSync(destination, payload);
+      else if (payload?.writeFile) await payload.writeFile(destination);
+      else if (payload?.getReadableStream) {
+        const chunks: Buffer[] = [];
+        for await (const chunk of payload.getReadableStream()) chunks.push(Buffer.from(chunk));
+        fs.writeFileSync(destination, Buffer.concat(chunks));
+      } else throw new Error('飞书未返回可写入的附件内容');
+      logger.info('attachment_downloaded', { messageType, destination });
+      return `请处理我发送的${messageType === 'image' ? '图片' : '文件'}。本地路径：${destination}${content.file_name ? `\n原文件名：${content.file_name}` : ''}`;
+    } catch (error) {
+      logger.error('attachment_download_failed', error, { messageType });
+      if (this.client && message.message_id) await this.client.im.message.reply({ path: { message_id: message.message_id }, data: { msg_type: 'text', content: JSON.stringify({ text: `❌ 附件下载失败：${formatFeishuError(error)}` }) } }).catch(() => undefined);
+      return '';
+    }
   }
 
   private async getProjects(refresh = false) {
@@ -326,6 +502,16 @@ function formatTurnStatus(threadId: string, turn: Awaited<ReturnType<CodexClient
   const activeTool = [...turn.items].reverse().find((item: any) => /ToolCall$/.test(item.type) && item.status === 'inProgress') as any;
   const detail = agentMessage?.text ?? (activeTool ? `正在执行：${activeTool.tool ?? activeTool.type}` : '暂时还没有新的文字回复');
   return `Session：${threadId}\n状态：${labels[turn.status] ?? turn.status}\n\n${String(detail).slice(0, 3500)}`;
+}
+
+function summarizeNotification(notification: any): string {
+  const method = String(notification.method ?? '');
+  const item = notification.params?.item ?? notification.params?.turn?.items?.at?.(-1);
+  if (item?.type === 'agentMessage' && item.text) return String(item.text).slice(0, 3000);
+  if (item?.tool || /ToolCall$/.test(item?.type ?? '')) return `正在执行：${item.tool ?? item.type}`;
+  if (method === 'turn/started') return '任务已经开始执行。';
+  if (method === 'turn/completed') return `任务已${notification.params?.turn?.status === 'failed' ? '失败' : '完成'}。`;
+  return `正在执行：${method.replace(/^item\//, '').replace(/^turn\//, '')}`;
 }
 
 const PAGE_SIZE = 10;

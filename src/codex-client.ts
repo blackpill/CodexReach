@@ -10,6 +10,8 @@ export class CodexClient extends EventEmitter {
   private pending = new Map<number, Pending>();
   private nextId = 1;
   private starting?: Promise<void>;
+  private reconnectTimer?: NodeJS.Timeout;
+  private stopping = false;
 
   constructor(private readonly bin = process.env.CODEX_BIN || 'codex') { super(); }
 
@@ -30,6 +32,10 @@ export class CodexClient extends EventEmitter {
       for (const item of this.pending.values()) item.reject(new Error(`Codex App Server 已退出 (${code})`));
       this.pending.clear();
       this.emit('offline');
+      if (!this.stopping) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = setTimeout(() => void this.start().catch((error) => this.emit('log', `Codex 重连失败：${error}`)), 2_000);
+      }
     });
     await this.request('initialize', {
       clientInfo: { name: 'feishu-codex-bridge', title: 'Feishu Codex Bridge', version: '0.1.0' },
@@ -92,6 +98,18 @@ export class CodexClient extends EventEmitter {
       if (!(error instanceof Error) || !error.message.includes('thread not found')) throw error;
       await this.resumeThread(threadId);
       return this.request('turn/start', params, 60_000);
+    }
+  }
+
+  isOnline() { return Boolean(this.child); }
+
+  async health() {
+    const startedAt = Date.now();
+    try {
+      await this.request('thread/list', { limit: 1, archived: false }, 5_000);
+      return { online: true, latencyMs: Date.now() - startedAt };
+    } catch (error) {
+      return { online: false, latencyMs: Date.now() - startedAt, error: error instanceof Error ? error.message : String(error) };
     }
   }
 

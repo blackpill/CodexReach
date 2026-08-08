@@ -8,6 +8,7 @@ import { CodexClient } from './codex-client.js';
 import { AuthStore } from './auth.js';
 import { FeishuGateway } from './feishu.js';
 import { groupProjects } from './types.js';
+import { logger } from './logger.js';
 
 try { process.loadEnvFile(); } catch { /* .env 可选 */ }
 
@@ -21,6 +22,9 @@ codex.on('notification', (event) => {
   const payload = JSON.stringify({ type: 'codex-event', event });
   for (const socket of sockets) if (socket.readyState === 1) socket.send(payload);
 });
+codex.on('online', () => logger.info('codex_online'));
+codex.on('offline', () => logger.warn('codex_offline'));
+codex.on('log', (message) => logger.info('codex_log', { message: String(message).slice(0, 4000) }));
 
 app.addHook('preHandler', async (request, reply) => {
   if (request.url.startsWith('/api/pair') || !request.url.startsWith('/api/')) return;

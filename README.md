@@ -6,6 +6,13 @@
 
 - 按工作目录展示全部 Codex Projects 和 Sessions
 - 读取完整 Session、继续发送任务、实时刷新、停止运行
+- 飞书实时任务卡片，显示执行状态、耗时、队列和最近进展
+- 卡片内停止、刷新与失败重试
+- 图片/文件自动下载到本地后交给 Codex
+- Session 级消息队列与连续消息合并，避免并发写入冲突
+- `/status` 服务与任务状态、`/doctor` 脱敏诊断
+- Codex App Server 自动重连、任务空闲超时保护
+- JSONL 结构化日志与自动清理
 - 飞书长连接机器人，无需公网回调地址
 - 每个 Codex Project 自动对应一个飞书话题消息群
 - 每个 Codex Session 自动对应群内一个独立话题，对话历史与上下文严格隔离
@@ -49,6 +56,8 @@ FEISHU_ALLOWED_OPEN_IDS=ou_xxx
 - `/use <session-id>`：选择 Session
 - `/new <绝对路径> <任务>`：创建真实 Session
 - `/stop`：停止当前任务
+- `/status [session-id]`：查看服务或任务状态
+- `/doctor`：运行不包含凭据的连接与目录诊断
 - `/help`：查看帮助
 - 选择 Session 后，普通文字会直接作为下一轮任务发送。
 
