@@ -41,6 +41,17 @@ describe('action collection and prefilter', () => {
       git: { headCommit: 'bbb', changedFiles: ['src/previous-change.ts'] },
     }))).toMatchObject({ eligible: false, signals: ['query_only'] });
   });
+
+  it('does not treat a requested deployment as completed when the result says it is still local', () => {
+    const result = prefilterActionContext(context({
+      turn: { id: 'turn-1', status: 'completed', items: [
+        { type: 'userMessage', content: [{ type: 'inputText', text: '修改 title 并部署' }] },
+        { type: 'agentMessage', text: '代码已修改，但尚未部署。' },
+      ] },
+    }));
+    expect(result.signals).toContain('local_only');
+    expect(result.signals).not.toContain('deployment');
+  });
 });
 
 describe('structured action detection', () => {

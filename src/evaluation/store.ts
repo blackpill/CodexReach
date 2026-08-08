@@ -5,6 +5,7 @@ import { assertCandidateTransition, assertDraftTransition, assertNodeTransition 
 import type {
   ActionBatch,
   ActionCandidate,
+  Deployment,
   EvaluationNode,
   EvaluationNodeStatus,
   OutboxEvent,
@@ -50,6 +51,22 @@ export class EvaluationStore {
         value_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS evaluation_deployments (
+        id TEXT PRIMARY KEY,
+        batch_id TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        deployment_id TEXT,
+        effective_at TEXT NOT NULL,
+        value_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(provider, deployment_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS evaluation_processed_events (
+        event_id TEXT PRIMARY KEY,
+        processed_at TEXT NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS evaluation_nodes (
@@ -163,6 +180,46 @@ export class EvaluationStore {
   getBatch(id: string): ActionBatch | undefined {
     const row = this.db.prepare('SELECT value_json FROM evaluation_action_batches WHERE id = ?').get(id) as JsonRow | undefined;
     return row ? JSON.parse(row.value_json) as ActionBatch : undefined;
+  }
+
+  saveDeployment(deployment: Deployment) {
+    this.db.prepare(`
+      INSERT INTO evaluation_deployments(
+        id, batch_id, provider, deployment_id, effective_at, value_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        batch_id = excluded.batch_id,
+        provider = excluded.provider,
+        deployment_id = excluded.deployment_id,
+        effective_at = excluded.effective_at,
+        value_json = excluded.value_json
+    `).run(
+      deployment.id,
+      deployment.batchId,
+      deployment.provider,
+      deployment.deploymentId ?? null,
+      deployment.effectiveAt,
+      JSON.stringify(deployment),
+      deployment.verifiedAt,
+    );
+  }
+
+  getDeployment(id: string): Deployment | undefined {
+    const row = this.db.prepare('SELECT value_json FROM evaluation_deployments WHERE id = ?').get(id) as JsonRow | undefined;
+    return row ? JSON.parse(row.value_json) as Deployment : undefined;
+  }
+
+  hasProcessedEvent(eventId: string): boolean {
+    return Boolean(this.db.prepare('SELECT 1 FROM evaluation_processed_events WHERE event_id = ?').get(eventId));
+  }
+
+  markEventProcessed(eventId: string, processedAt: string): boolean {
+    const result = this.db.prepare(`
+      INSERT INTO evaluation_processed_events(event_id, processed_at)
+      VALUES (?, ?)
+      ON CONFLICT(event_id) DO NOTHING
+    `).run(eventId, processedAt);
+    return result.changes === 1;
   }
 
   saveNode(node: EvaluationNode) {

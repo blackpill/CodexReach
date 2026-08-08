@@ -58,12 +58,12 @@ export function prefilterActionContext(context: TurnActionContext): PrefilterRes
     reasons.push('修改尚未进入真实环境');
     score += 0.15;
   }
-  if (patterns.productionChange.test(text)) {
+  if (patterns.productionChange.test(context.agentResult)) {
     signals.push('production_change');
     reasons.push('存在真实环境变更信号');
     score += 0.35;
   }
-  if (patterns.deployment.test(text)) {
+  if (patterns.deployment.test(context.agentResult)) {
     signals.push('deployment');
     reasons.push('存在生产部署信号');
     score += 0.45;

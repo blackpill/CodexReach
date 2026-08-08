@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { FeishuGateway, formatDesktopTurn, parseDocumentUrl, parseNewCommand } from './feishu.js';
+import type { EvaluationDraft } from './evaluation/batch-service.js';
 
 describe('parseNewCommand', () => {
   const projectPath = '/Users/kenny/Documents/ChatGPT/Feishu AI Codex Bot';
@@ -58,5 +59,24 @@ describe('Desktop Session 同步', () => {
 
     expect(create).not.toHaveBeenCalled();
     expect(gateway.syncedTurns.get('session-1')).toEqual(['turn-1']);
+  });
+});
+
+describe('评估草稿路由', () => {
+  it('优先回复到行动来源 Session 话题', async () => {
+    const reply = vi.fn(async () => ({ code: 0, data: { message_id: 'message-1' } }));
+    const gateway = new FeishuGateway({} as any) as any;
+    gateway.client = { im: { message: { reply } } };
+    gateway.projectGroups = new Map([['/projects/site', { projectPath: '/projects/site', projectName: 'Site', chatId: 'chat-1' }]]);
+    gateway.sessionTopics = new Map([['session-1', { sessionId: 'session-1', chatId: 'chat-1', threadId: 'thread-1', rootMessageId: 'root-1' }]]);
+    const draft: EvaluationDraft = {
+      batch: { id: 'batch-1', projectId: 'project-1', candidateIds: ['candidate-1'], summary: 'SEO', effectiveAt: '2026-08-08T00:00:00.000Z', draftStatus: 'draft_pending', createdAt: '2026-08-08T00:00:00.000Z', updatedAt: '2026-08-08T00:00:00.000Z' },
+      deployment: { id: 'deployment-1', batchId: 'batch-1', provider: 'codex', productionUrl: 'https://example.com', verifiedAt: '2026-08-08T00:00:00.000Z', effectiveAt: '2026-08-08T00:00:00.000Z', evidence: {} },
+      candidate: { id: 'candidate-1', projectId: 'project-1', sourceSessionIds: ['session-1'], firstDetectedAt: '2026-08-08T00:00:00.000Z', lastUpdatedAt: '2026-08-08T00:00:00.000Z', changedFiles: [], actionSummaries: ['修改 title'], suggestedTemplate: 'seo', affectedTargets: ['/'], confidence: 0.9, status: 'deployed', staleAt: '2026-09-08T00:00:00.000Z', expiresAt: '2026-11-08T00:00:00.000Z' },
+      actions: [{ actionType: 'seo_change', summary: '修改 title', affectedTargets: ['/'], requiresEvaluation: true, template: 'seo', confidence: 0.9, productionState: 'deployed', reason: '需要观察' }],
+    };
+
+    await expect(gateway.sendEvaluationDraft('/projects/site', 'session-1', draft)).resolves.toBe(true);
+    expect(reply).toHaveBeenCalledWith(expect.objectContaining({ path: { message_id: 'root-1' } }));
   });
 });

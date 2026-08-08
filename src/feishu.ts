@@ -6,6 +6,7 @@ import type { CodexClient } from './codex-client.js';
 import { groupProjects, type Project } from './types.js';
 import { logger } from './logger.js';
 import { codexEventId, StateStore } from './state-store.js';
+import type { EvaluationDraft } from './evaluation/batch-service.js';
 
 type Card = { config: Record<string, unknown>; header: Record<string, unknown>; elements: Array<Record<string, unknown>> };
 type Reply = string | Card;
@@ -16,6 +17,7 @@ type QueuedMessage = { text: string; target: Target; at: number };
 type TaskState = { startedAt: number; lastActivityAt: number; turnId?: string; cardMessageId?: string; status: 'queued' | 'running' | 'completed' | 'failed' | 'stopped' | 'timeout'; detail?: string; lastPrompt?: string };
 type DocumentBinding = { fileToken: string; fileType: 'doc' | 'docx'; url: string; projectPath: string; projectName: string };
 type CommentTarget = { fileToken: string; fileType: 'doc' | 'docx'; commentId: string; replyId?: string; openId: string };
+type EvaluationDraftHandler = (batchId: string, action: 'confirm' | 'ignore') => Promise<void> | void;
 
 const CODEX_REACH_LABEL = 'CodexReach';
 
@@ -57,6 +59,8 @@ export class FeishuGateway {
   private commentQueues = new Map<string, string[]>();
   private handledComments: string[] = [];
   private syncedTurns = new Map<string, string[]>();
+  private evaluationHubTopics = new Map<string, SessionTopic>();
+  private evaluationDraftHandler?: EvaluationDraftHandler;
   private client?: lark.Client;
   private watchdog?: NodeJS.Timeout;
   private desktopSyncTimer?: NodeJS.Timeout;
@@ -65,6 +69,37 @@ export class FeishuGateway {
     process.env.CODEXREACH_STATE_DB ? path.resolve(process.env.CODEXREACH_STATE_DB) : path.resolve('.data/feishu-state.sqlite'),
   );
   constructor(private codex: CodexClient) { this.loadState(); }
+
+  setEvaluationDraftHandler(handler: EvaluationDraftHandler) {
+    this.evaluationDraftHandler = handler;
+  }
+
+  async sendEvaluationDraft(projectPath: string, sourceSessionId: string, draft: EvaluationDraft): Promise<boolean> {
+    if (!this.client) return false;
+    const group = this.projectGroups.get(projectPath);
+    if (!group) {
+      logger.warn('evaluation_project_group_missing', { projectPath, batchId: draft.batch.id });
+      return false;
+    }
+    const topic = this.sessionTopics.get(sourceSessionId) ?? await this.ensureEvaluationHubTopic(this.client, group);
+    const actionLines = draft.actions.map((action) => `• ${action.summary}`).join('\n').slice(0, 1800);
+    const content = JSON.stringify({
+      config: { wide_screen_mode: true, update_multi: true },
+      header: { template: 'orange', title: { tag: 'plain_text', content: '检测到需要后续评估的生产变更' } },
+      elements: [
+        { tag: 'div', text: { tag: 'lark_md', content: `**项目**\n${group.projectName}\n\n**生产生效时间**\n${draft.deployment.effectiveAt}\n\n**行动批次**\n${actionLines}\n\n**建议模板**\n${draft.candidate.suggestedTemplate.toUpperCase()}` } },
+        { tag: 'note', elements: [{ tag: 'plain_text', content: `Commit：${draft.deployment.commitSha ?? '未识别'}　批次：${draft.batch.id}` }] },
+        { tag: 'action', actions: [
+          { tag: 'button', type: 'primary', text: { tag: 'plain_text', content: '确认创建' }, value: { action: 'evaluation_draft_confirm', batchId: draft.batch.id } },
+          { tag: 'button', text: { tag: 'plain_text', content: '无需评估' }, value: { action: 'evaluation_draft_ignore', batchId: draft.batch.id } },
+        ] },
+      ],
+    });
+    const sent = await this.client.im.message.reply({ path: { message_id: topic.rootMessageId }, data: { msg_type: 'interactive', content } });
+    if (sent.code) throw new Error(`发送评估草稿失败：${sent.msg}`);
+    logger.info('evaluation_draft_sent', { batchId: draft.batch.id, projectPath, sourceSessionId, rootMessageId: topic.rootMessageId });
+    return true;
+  }
 
   start() {
     const appId = process.env.FEISHU_APP_ID, appSecret = process.env.FEISHU_APP_SECRET;
@@ -195,6 +230,11 @@ export class FeishuGateway {
           if (!target) return toastResponse('找不到回复目标', 'error');
           await this.enqueue(value.sessionId, state.lastPrompt, target, false);
           return toastResponse('已加入执行队列', 'success');
+        }
+        if (value.action === 'evaluation_draft_confirm' || value.action === 'evaluation_draft_ignore') {
+          if (!this.evaluationDraftHandler) return toastResponse('评估系统尚未启用', 'error');
+          await this.evaluationDraftHandler(value.batchId, value.action === 'evaluation_draft_confirm' ? 'confirm' : 'ignore');
+          return toastResponse(value.action === 'evaluation_draft_confirm' ? '已确认评估计划草稿' : '已标记为无需评估', 'success');
         }
       },
       'drive.notice.comment_add_v1': async (event: any) => {
@@ -748,6 +788,22 @@ export class FeishuGateway {
     return topic;
   }
 
+  private async ensureEvaluationHubTopic(client: lark.Client, group: ProjectGroup): Promise<SessionTopic> {
+    const existing = this.evaluationHubTopics.get(group.projectPath);
+    if (existing) return existing;
+    const sent = await client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: {
+      receive_id: group.chatId,
+      msg_type: 'text',
+      content: JSON.stringify({ text: '部署与评估\n\n本话题由 CodexReach 自动创建，用于处理无法关联原 Codex Session 的部署、评估确认和异常。' }),
+      uuid: `codex-evaluation-hub-${Buffer.from(group.projectPath).toString('base64url')}`.slice(0, 50),
+    }});
+    if (sent.code || !sent.data?.message_id || !sent.data.thread_id) throw new Error(`创建部署与评估话题失败：${sent.msg ?? '未返回 thread_id'}`);
+    const topic = { sessionId: `evaluation-hub:${group.projectPath}`, chatId: group.chatId, threadId: sent.data.thread_id, rootMessageId: sent.data.message_id };
+    this.evaluationHubTopics.set(group.projectPath, topic);
+    this.saveState();
+    return topic;
+  }
+
   private loadState() {
     try {
       const data = this.stateStore.loadSnapshot();
@@ -755,6 +811,7 @@ export class FeishuGateway {
       this.targets = new Map(data.targets ?? []);
       this.projectGroups = new Map(data.projectGroups ?? []);
       this.sessionTopics = new Map(data.sessionTopics ?? []);
+      this.evaluationHubTopics = new Map(data.evaluationHubTopics ?? []);
       this.handledMessages = (data.handledMessages ?? []).map((entry: any) => Array.isArray(entry) ? entry[1] : entry);
       this.documentBindings = new Map(data.documentBindings ?? []);
       this.commentSessions = new Map(data.commentSessions ?? []);
@@ -767,7 +824,7 @@ export class FeishuGateway {
 
   private saveState() {
     this.stateStore.saveSnapshot({
-      selected: [...this.selected], targets: [...this.targets], projectGroups: [...this.projectGroups], sessionTopics: [...this.sessionTopics], handledMessages: this.handledMessages,
+      selected: [...this.selected], targets: [...this.targets], projectGroups: [...this.projectGroups], sessionTopics: [...this.sessionTopics], evaluationHubTopics: [...this.evaluationHubTopics], handledMessages: this.handledMessages,
       documentBindings: [...this.documentBindings], commentSessions: [...this.commentSessions], commentTargets: [...this.commentTargets], commentQueues: [...this.commentQueues], handledComments: this.handledComments,
       syncedTurns: [...this.syncedTurns],
     });

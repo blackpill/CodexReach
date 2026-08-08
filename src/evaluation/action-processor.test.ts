@@ -41,13 +41,14 @@ const notification = {
 
 describe('ActionProcessor', () => {
   it('collects, classifies and persists a completed turn exactly once', async () => {
-    const { processor, store } = setup();
+    const { processor, readThread, store } = setup();
     await processor.handleNotification(notification);
     await processor.handleNotification(notification);
 
     const projectId = Buffer.from('/projects/site').toString('base64url');
     const candidates = store.listActiveCandidates(projectId);
     expect(candidates).toHaveLength(1);
+    expect(readThread).toHaveBeenCalledTimes(1);
     expect(candidates[0]).toMatchObject({
       suggestedTemplate: 'seo',
       sourceSessionIds: ['session-1'],

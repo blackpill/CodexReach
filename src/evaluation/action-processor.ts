@@ -1,19 +1,26 @@
 import type { CodexClient } from '../codex-client.js';
 import type { CodexTurn, RpcNotification } from '../types.js';
 import { logger } from '../logger.js';
-import { collectTurnActionContext } from './action-collector.js';
-import { detectStructuredActions, type StructuredActionClassifier } from './action-detector.js';
+import { collectTurnActionContext, type TurnActionContext } from './action-collector.js';
+import { detectStructuredActions, type StructuredAction, type StructuredActionClassifier, type StructuredDetectionResult } from './action-detector.js';
 import { prefilterActionContext } from './action-prefilter.js';
 import { createCandidate, mergeIntoBestCandidate } from './candidate-merger.js';
 import { collectGitEvidence } from './git-evidence.js';
 import { heuristicActionClassifier } from './heuristic-classifier.js';
 import { EvaluationStore } from './store.js';
+import type { ActionCandidate } from './types.js';
 
 export type ActionProcessorOptions = {
   enabled?: boolean;
   classifier?: StructuredActionClassifier;
   collectGit?: typeof collectGitEvidence;
   now?: () => string;
+  onCandidateSaved?: (input: {
+    candidate: ActionCandidate;
+    actions: StructuredAction[];
+    detection: StructuredDetectionResult;
+    context: TurnActionContext;
+  }) => Promise<void> | void;
 };
 
 export class ActionProcessor {
@@ -21,6 +28,7 @@ export class ActionProcessor {
   private readonly classifier: StructuredActionClassifier;
   private readonly collectGit: typeof collectGitEvidence;
   private readonly now: () => string;
+  private readonly onCandidateSaved?: ActionProcessorOptions['onCandidateSaved'];
   private readonly inFlight = new Set<string>();
 
   constructor(
@@ -32,6 +40,7 @@ export class ActionProcessor {
     this.classifier = options.classifier ?? heuristicActionClassifier;
     this.collectGit = options.collectGit ?? collectGitEvidence;
     this.now = options.now ?? (() => new Date().toISOString());
+    this.onCandidateSaved = options.onCandidateSaved;
   }
 
   async handleNotification(notification: RpcNotification): Promise<void> {
@@ -41,6 +50,7 @@ export class ActionProcessor {
     const turnId = params?.turn?.id;
     if (!sessionId || !turnId) return;
     const eventId = `codex:turn.completed:${sessionId}:${turnId}`;
+    if (this.store.hasProcessedEvent(eventId)) return;
     if (this.inFlight.has(eventId)) return;
     this.inFlight.add(eventId);
     try {
@@ -56,15 +66,21 @@ export class ActionProcessor {
       const context = collectTurnActionContext({ thread, turn, completedAt: this.now(), git });
       const prefilter = prefilterActionContext(context);
       if (!prefilter.eligible) {
+        this.store.markEventProcessed(eventId, this.now());
         logger.info('evaluation_turn_filtered', { eventId, projectId: context.projectId, signals: prefilter.signals });
         return;
       }
       const detection = await detectStructuredActions(this.classifier, context, prefilter);
       const actions = detection.actions.filter((action) => action.requiresEvaluation);
-      if (!actions.length) return;
+      if (!actions.length) {
+        this.store.markEventProcessed(eventId, this.now());
+        return;
+      }
       const incoming = createCandidate({ context, actions });
       const merged = mergeIntoBestCandidate(this.store.listActiveCandidates(context.projectId), incoming);
       this.store.saveCandidate(merged.candidate);
+      await this.onCandidateSaved?.({ candidate: merged.candidate, actions, detection, context });
+      this.store.markEventProcessed(eventId, this.now());
       logger.info('evaluation_candidate_saved', {
         eventId,
         candidateId: merged.candidate.id,

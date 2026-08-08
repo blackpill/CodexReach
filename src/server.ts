@@ -11,6 +11,7 @@ import { groupProjects } from './types.js';
 import { logger } from './logger.js';
 import { ActionProcessor } from './evaluation/action-processor.js';
 import { EvaluationStore } from './evaluation/store.js';
+import { BatchService } from './evaluation/batch-service.js';
 
 try { process.loadEnvFile(); } catch { /* .env 可选 */ }
 
@@ -22,8 +23,30 @@ await app.register(websocket);
 const evaluationStore = new EvaluationStore(
   process.env.CODEXREACH_STATE_DB ? path.resolve(process.env.CODEXREACH_STATE_DB) : path.resolve('.data/feishu-state.sqlite'),
 );
+const evaluationBatchService = new BatchService(evaluationStore);
+const feishu = new FeishuGateway(codex);
+feishu.setEvaluationDraftHandler(async (batchId, action) => {
+  evaluationBatchService.updateDraftStatus(batchId, action === 'confirm' ? 'confirmed' : 'ignored');
+  logger.info('evaluation_draft_action', { batchId, action });
+});
 const evaluationProcessor = new ActionProcessor(codex, evaluationStore, {
   enabled: process.env.EVALUATION_SYSTEM_ENABLED === 'true',
+  onCandidateSaved: async ({ candidate, actions, context }) => {
+    if (!actions.some((action) => action.productionState === 'deployed')) return;
+    const draft = evaluationBatchService.createFromVerifiedTurn({ candidate, actions, context });
+    const sent = await feishu.sendEvaluationDraft(context.projectPath, context.sessionId, draft);
+    if (!sent) {
+      const now = new Date().toISOString();
+      evaluationStore.enqueue({
+        id: `outbox-${draft.batch.id}`,
+        idempotencyKey: `evaluation-draft:${draft.batch.id}`,
+        eventType: 'feishu.evaluation-draft.send',
+        aggregateId: draft.batch.id,
+        payload: { projectPath: context.projectPath, sourceSessionId: context.sessionId },
+        status: 'pending', retryCount: 0, nextRetryAt: now, createdAt: now, updatedAt: now,
+      });
+    }
+  },
 });
 
 const sockets = new Set<any>();
@@ -60,7 +83,7 @@ app.setNotFoundHandler((request, reply) => request.url.startsWith('/api/') ? rep
 
 function localIp() { return Object.values(os.networkInterfaces()).flat().find((i) => i?.family === 'IPv4' && !i.internal)?.address ?? '127.0.0.1'; }
 const host = process.env.HOST ?? '0.0.0.0', port = Number(process.env.PORT ?? 4317);
-new FeishuGateway(codex).start();
+feishu.start();
 await app.listen({ host, port });
 const url = `http://${localIp()}:${port}`; const code = auth.rotatePairCode();
 app.log.info(`手机控制台：${url}  配对码：${code}`);
