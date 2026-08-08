@@ -2,6 +2,7 @@ export type RpcNotification = { method: string; params?: unknown };
 export type CodexThread = {
   id: string; sessionId: string; preview: string; name: string | null; cwd: string;
   createdAt: number; updatedAt: number; status: { type: string }; turns: CodexTurn[];
+  startedTurnId?: string;
 };
 export type CodexTurn = { id: string; status: string; items: Array<Record<string, unknown>> };
 export type Project = { id: string; name: string; path: string; updatedAt: number; sessions: CodexThread[] };

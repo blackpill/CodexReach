@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import type { CodexClient } from './codex-client.js';
 import { groupProjects, type Project } from './types.js';
 import { logger } from './logger.js';
+import { codexEventId, StateStore } from './state-store.js';
 
 type Card = { config: Record<string, unknown>; header: Record<string, unknown>; elements: Array<Record<string, unknown>> };
 type Reply = string | Card;
@@ -23,6 +24,24 @@ function projectGroupName(projectName: string) {
   return `${CODEX_REACH_LABEL}｜${projectName}`.slice(0, 60);
 }
 
+export function parseNewCommand(raw: string, isDirectory = (candidate: string) => {
+  try { return fs.statSync(candidate).isDirectory(); } catch { return false; }
+}) {
+  const quoted = raw.match(/^(["'])(.*?)\1\s+([\s\S]+)$/);
+  if (quoted) return { cwd: quoted[2], prompt: quoted[3].trim() };
+
+  const parts = raw.trim().split(/\s+/);
+  // Prefer the longest existing directory prefix, so absolute paths containing
+  // spaces work without requiring quotes.
+  for (let index = parts.length - 1; index >= 1; index--) {
+    const cwd = parts.slice(0, index).join(' ');
+    if (path.isAbsolute(cwd) && isDirectory(cwd)) {
+      return { cwd, prompt: parts.slice(index).join(' ') };
+    }
+  }
+  return null;
+}
+
 export class FeishuGateway {
   private selected = new Map<string, string>();
   private targets = new Map<string, Target>();
@@ -37,9 +56,14 @@ export class FeishuGateway {
   private commentTargets = new Map<string, CommentTarget>();
   private commentQueues = new Map<string, string[]>();
   private handledComments: string[] = [];
+  private syncedTurns = new Map<string, string[]>();
   private client?: lark.Client;
   private watchdog?: NodeJS.Timeout;
-  private readonly stateFile = path.resolve('.data/feishu-state.json');
+  private desktopSyncTimer?: NodeJS.Timeout;
+  private desktopSyncRunning = false;
+  private readonly stateStore = new StateStore(
+    process.env.CODEXREACH_STATE_DB ? path.resolve(process.env.CODEXREACH_STATE_DB) : path.resolve('.data/feishu-state.sqlite'),
+  );
   constructor(private codex: CodexClient) { this.loadState(); }
 
   start() {
@@ -84,6 +108,7 @@ export class FeishuGateway {
             console.info('[feishu-route]', { chatId, rawThreadId, rootMessageId, matchedSessionId: topic?.sessionId ?? null });
             if (!topic) {
               const created = await this.codex.create(projectGroup.projectPath, text);
+              if (created.startedTurnId) this.recordBridgeTurn(created.id, created.startedTurnId);
               topic = { sessionId: created.id, chatId, threadId, rootMessageId };
               this.sessionTopics.set(created.id, topic);
               this.targets.set(created.id, { chatId, openId, rootMessageId });
@@ -189,6 +214,21 @@ export class FeishuGateway {
         }
       }
       if (notification.method !== 'turn/completed') return;
+      const completedTurnId = notification.params?.turn?.id;
+      // 只有从飞书桥接发起的回合才直接视为已展示。Desktop 发起的
+      // 回合必须留给轮询器读取完整的 userMessage + agentMessage。
+      if (threadId && completedTurnId && this.stateStore.isCodexReachTurn(threadId, completedTurnId)) {
+        const status = notification.params?.turn?.status ?? 'completed';
+        this.stateStore.recordTurn({
+          eventId: codexEventId(threadId, completedTurnId, 'turn.completed'),
+          sessionId: threadId,
+          turnId: completedTurnId,
+          eventType: 'turn.completed',
+          origin: 'codexreach',
+          status,
+        });
+        this.markTurnSynced(threadId, completedTurnId);
+      }
       const commentTarget = threadId ? this.commentTargets.get(threadId) : undefined;
       if (threadId && commentTarget) {
         await this.completeCommentRun(threadId, commentTarget, notification.params?.turn).catch((error) => logger.error('comment_reply_failed', error, { threadId }));
@@ -213,7 +253,67 @@ export class FeishuGateway {
     const ws = new lark.WSClient({ appId, appSecret, loggerLevel: lark.LoggerLevel.info });
     void ws.start({ eventDispatcher: dispatcher });
     this.watchdog = setInterval(() => void this.checkIdleTasks(), 30_000);
+    const syncIntervalMs = Math.max(5_000, Number(process.env.FEISHU_DESKTOP_SYNC_INTERVAL_SECONDS ?? 10) * 1_000);
+    this.desktopSyncTimer = setInterval(() => void this.syncDesktopSessions(), syncIntervalMs);
+    // 启动后先建立已有会话的同步基线，之后只增量回写，避免历史消息刷屏。
+    void this.syncDesktopSessions(true);
     return true;
+  }
+
+  private async syncDesktopSessions(establishBaseline = false) {
+    if (!this.client || this.desktopSyncRunning) return;
+    this.desktopSyncRunning = true;
+    try {
+      const threads = await this.codex.listThreads();
+      for (const thread of threads) {
+        const group = this.projectGroups.get(thread.cwd);
+        if (!group) continue;
+        // thread/list 的 turns 通常为空（itemsView=notLoaded），必须读取完整
+        // Session 才能发现由 Codex Desktop 产生的新回合。
+        const fullThread = await this.codex.readThread(thread.id);
+        const completed = fullThread.turns.filter((turn) => turn.status !== 'inProgress');
+        const hasSyncState = this.syncedTurns.has(thread.id);
+        const known = new Set(this.syncedTurns.get(thread.id) ?? []);
+        // 启动建立基线时不得创建话题。否则每次服务重启都会把
+        // 所有历史 Session 逐条发到飞书，看起来像机器人自动列项目清单。
+        if (establishBaseline && !hasSyncState) {
+          this.syncedTurns.set(thread.id, completed.map((turn) => turn.id).slice(-100));
+          continue;
+        }
+        const topicBeforeSync = this.sessionTopics.get(thread.id);
+        // 新发现的 Desktop Session 默认同步最近一轮；已有 Session 同步所有新增回合。
+        const pending = !hasSyncState
+          ? completed.slice(-1)
+          : completed.filter((turn) => !known.has(turn.id));
+        // 没有新内容时不为历史 Session 补建话题。
+        if (!pending.length) continue;
+        const topic = topicBeforeSync ?? await this.ensureSessionTopic(this.client, group, thread.id, thread.name || thread.preview || '未命名 Session');
+        for (const turn of pending) {
+          const text = formatDesktopTurn(turn);
+          if (!text) {
+            logger.warn('desktop_turn_content_not_loaded', { sessionId: thread.id, turnId: turn.id, itemTypes: turn.items.map((item: any) => item.type) });
+            continue;
+          }
+          const sent = await this.client.im.message.reply({ path: { message_id: topic.rootMessageId }, data: {
+            msg_type: 'text', content: JSON.stringify({ text: text.slice(0, 3900) }),
+          }});
+          logger.info('desktop_turn_synced', { sessionId: thread.id, turnId: turn.id, messageId: sent.data?.message_id, rootMessageId: topic.rootMessageId });
+          this.markTurnSynced(thread.id, turn.id);
+        }
+      }
+      this.saveState();
+    } catch (error) {
+      logger.error('desktop_session_sync_failed', error);
+    } finally {
+      this.desktopSyncRunning = false;
+    }
+  }
+
+  private markTurnSynced(sessionId: string, turnId: string) {
+    const ids = this.syncedTurns.get(sessionId) ?? [];
+    if (!ids.includes(turnId)) ids.push(turnId);
+    this.syncedTurns.set(sessionId, ids.slice(-100));
+    this.saveState();
   }
 
   async handle(user: string, input: string, client?: lark.Client, context?: { chatId?: string }): Promise<Reply> {
@@ -315,10 +415,11 @@ export class FeishuGateway {
     if (command === '/doctor') return this.doctor();
     if (command === '/new') {
       const raw = input.slice('/new'.length).trim();
-      const quoted = raw.match(/^"([^"]+)"\s+(.+)$/s);
-      const [cwd, prompt] = quoted ? [quoted[1], quoted[2]] : [rest[0], rest.slice(1).join(' ')];
-      if (!cwd || !prompt) return '用法：/new <绝对路径> <任务>；路径含空格时请使用双引号。';
+      const parsed = parseNewCommand(raw);
+      if (!parsed?.cwd || !parsed.prompt) return '用法：/new <绝对路径> <任务>；项目目录必须存在，路径含空格时可直接输入或使用引号。';
+      const { cwd, prompt } = parsed;
       const thread = await this.codex.create(cwd, prompt);
+      if (thread.startedTurnId) this.recordBridgeTurn(thread.id, thread.startedTurnId);
       this.selected.set(user, thread.id); this.tasks.set(thread.id, { startedAt: Date.now(), lastActivityAt: Date.now(), status: 'running', lastPrompt: prompt }); this.saveState();
       return this.taskCard(thread.id);
     }
@@ -344,7 +445,8 @@ export class FeishuGateway {
     }
     const state: TaskState = { startedAt: Date.now(), lastActivityAt: Date.now(), status: 'running', lastPrompt: text };
     this.tasks.set(sessionId, state);
-    await this.codex.send(sessionId, text);
+    const started = await this.codex.send(sessionId, text);
+    if (started?.turn?.id) this.recordBridgeTurn(sessionId, started.turn.id);
     if (createCard) await this.sendTaskCard(sessionId, target, 'running');
   }
 
@@ -356,7 +458,7 @@ export class FeishuGateway {
     if (!queue.length) this.queues.delete(sessionId);
     const state: TaskState = { startedAt: Date.now(), lastActivityAt: Date.now(), status: 'running', lastPrompt: next.text, cardMessageId: this.tasks.get(sessionId)?.cardMessageId };
     this.tasks.set(sessionId, state);
-    try { await this.codex.send(sessionId, next.text); await this.updateTaskCard(sessionId); }
+    try { const started = await this.codex.send(sessionId, next.text); if (started?.turn?.id) this.recordBridgeTurn(sessionId, started.turn.id); await this.updateTaskCard(sessionId); }
     catch (error) { state.status = 'failed'; state.detail = formatCodexSubmitError(error); await this.updateTaskCard(sessionId); }
   }
 
@@ -411,7 +513,7 @@ export class FeishuGateway {
     const checks = [
       `Codex App Server：${health.online ? `正常（${health.latencyMs}ms）` : `异常：${health.error}`}`,
       `飞书长连接：${this.client ? '已初始化' : '未初始化'}`,
-      `状态目录：${fs.existsSync(path.dirname(this.stateFile)) ? '可用' : '尚未创建'}`,
+      `状态数据库：${fs.existsSync(this.stateStore.databasePath) ? '可用' : '尚未创建'}`,
       `附件目录：${this.ensureMediaDir()}`,
       `运行任务：${[...this.tasks.values()].filter((x) => x.status === 'running').length}`,
       `排队消息：${[...this.queues.values()].reduce((n, q) => n + q.length, 0)}`,
@@ -491,9 +593,11 @@ export class FeishuGateway {
     }
     let sessionId = existingSession;
     if (sessionId) {
-      await this.codex.send(sessionId, prompt);
+      const started = await this.codex.send(sessionId, prompt);
+      if (started?.turn?.id) this.recordBridgeTurn(sessionId, started.turn.id);
     } else {
       const thread = await this.codex.create(binding.projectPath, prompt);
+      if (thread.startedTurnId) this.recordBridgeTurn(thread.id, thread.startedTurnId);
       sessionId = thread.id;
       this.commentSessions.set(scope, thread.id);
     }
@@ -528,7 +632,7 @@ export class FeishuGateway {
     this.saveState();
     const state: TaskState = { startedAt: Date.now(), lastActivityAt: Date.now(), status: 'running', lastPrompt: prompt };
     this.tasks.set(threadId, state);
-    try { await this.codex.send(threadId, prompt); }
+    try { const started = await this.codex.send(threadId, prompt); if (started?.turn?.id) this.recordBridgeTurn(threadId, started.turn.id); }
     catch (error) {
       state.status = 'failed'; state.detail = formatCodexSubmitError(error);
       const target = this.commentTargets.get(threadId);
@@ -646,26 +750,38 @@ export class FeishuGateway {
 
   private loadState() {
     try {
-      const data = JSON.parse(fs.readFileSync(this.stateFile, 'utf8'));
+      const data = this.stateStore.loadSnapshot();
       this.selected = new Map(data.selected ?? []);
       this.targets = new Map(data.targets ?? []);
       this.projectGroups = new Map(data.projectGroups ?? []);
       this.sessionTopics = new Map(data.sessionTopics ?? []);
-      this.handledMessages = data.handledMessages ?? [];
+      this.handledMessages = (data.handledMessages ?? []).map((entry: any) => Array.isArray(entry) ? entry[1] : entry);
       this.documentBindings = new Map(data.documentBindings ?? []);
       this.commentSessions = new Map(data.commentSessions ?? []);
       this.commentTargets = new Map(data.commentTargets ?? []);
       this.commentQueues = new Map(data.commentQueues ?? []);
-      this.handledComments = data.handledComments ?? [];
+      this.handledComments = (data.handledComments ?? []).map((entry: any) => Array.isArray(entry) ? entry[1] : entry);
+      this.syncedTurns = new Map(data.syncedTurns ?? []);
     } catch { /* 首次启动 */ }
   }
 
   private saveState() {
-    fs.mkdirSync(path.dirname(this.stateFile), { recursive: true });
-    fs.writeFileSync(this.stateFile, JSON.stringify({
+    this.stateStore.saveSnapshot({
       selected: [...this.selected], targets: [...this.targets], projectGroups: [...this.projectGroups], sessionTopics: [...this.sessionTopics], handledMessages: this.handledMessages,
       documentBindings: [...this.documentBindings], commentSessions: [...this.commentSessions], commentTargets: [...this.commentTargets], commentQueues: [...this.commentQueues], handledComments: this.handledComments,
-    }, null, 2));
+      syncedTurns: [...this.syncedTurns],
+    });
+  }
+
+  private recordBridgeTurn(sessionId: string, turnId: string) {
+    this.stateStore.recordTurn({
+      eventId: codexEventId(sessionId, turnId, 'turn.started'),
+      sessionId,
+      turnId,
+      eventType: 'turn.started',
+      origin: 'codexreach',
+      status: 'running',
+    });
   }
 }
 
@@ -792,4 +908,24 @@ function buildCommentPrompt(binding: DocumentBinding, question: string, quote?: 
 function extractAgentAnswer(turn: any): string {
   const item = [...(turn?.items ?? [])].reverse().find((entry: any) => entry.type === 'agentMessage' && entry.text);
   return String(item?.text ?? '').trim();
+}
+
+export function formatDesktopTurn(turn: any): string {
+  const userItem = (turn?.items ?? []).find((item: any) => item.type === 'userMessage');
+  const agentItem = [...(turn?.items ?? [])].reverse().find((item: any) => item.type === 'agentMessage' && item.text);
+  const userText = extractUserText(userItem);
+  const agentText = String(agentItem?.text ?? '').trim();
+  if (!userText && !agentText) return '';
+  return [
+    '🖥️ 来自 Codex Desktop',
+    userText ? `\n你：\n${userText}` : '',
+    agentText ? `\nCodex：\n${agentText}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+function extractUserText(item: any): string {
+  if (!item) return '';
+  if (typeof item.text === 'string') return item.text.trim();
+  const content = Array.isArray(item.content) ? item.content : [];
+  return content.map((part: any) => part?.text ?? part?.inputText ?? '').filter(Boolean).join('\n').trim();
 }

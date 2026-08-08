@@ -38,7 +38,7 @@ export class CodexClient extends EventEmitter {
       }
     });
     await this.request('initialize', {
-      clientInfo: { name: 'feishu-codex-bridge', title: 'Feishu Codex Bridge', version: '0.1.0' },
+      clientInfo: { name: 'codexreach', title: 'CodexReach', version: '0.1.0' },
       capabilities: { experimentalApi: true, requestAttestation: false },
     });
     this.notify('initialized', {});
@@ -90,7 +90,7 @@ export class CodexClient extends EventEmitter {
     const params = {
       threadId, input: [{ type: 'text', text, text_elements: [] }],
       approvalPolicy: 'never', sandboxPolicy: { type: 'dangerFullAccess' },
-      responsesapiClientMetadata: { source: 'feishu-codex-bridge' },
+      responsesapiClientMetadata: { source: 'codexreach' },
     };
     try {
       return await this.request('turn/start', params, 60_000);
@@ -114,11 +114,17 @@ export class CodexClient extends EventEmitter {
   }
 
   async create(cwd: string, text: string) {
-    const started = await this.request('thread/start', { cwd, approvalPolicy: 'never', sandbox: 'danger-full-access' });
+    const started = await this.request('thread/start', {
+      cwd,
+      approvalPolicy: 'never',
+      sandbox: 'danger-full-access',
+      // Codex Desktop only surfaces top-level user threads in its task list.
+      threadSource: 'user',
+    });
     const name = text.replace(/\s+/g, ' ').trim().slice(0, 50) || '飞书新任务';
     await this.request('thread/name/set', { threadId: started.thread.id, name });
-    await this.send(started.thread.id, text);
-    return started.thread;
+    const turn = await this.send(started.thread.id, text);
+    return { ...started.thread, startedTurnId: turn?.turn?.id };
   }
 
   interrupt(threadId: string, turnId: string) { return this.request('turn/interrupt', { threadId, turnId }); }

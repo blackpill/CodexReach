@@ -4,13 +4,17 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 NODE="$(command -v node)"
 CODEX="$(command -v codex)"
 BIN_DIR="$(dirname "$NODE")"
-PLIST="$HOME/Library/LaunchAgents/com.local.feishu-codex-bridge.plist"
+PLIST="$HOME/Library/LaunchAgents/com.local.codexreach.plist"
+LEGACY_PLIST="$HOME/Library/LaunchAgents/com.local.feishu-codex-bridge.plist"
 mkdir -p "$HOME/Library/LaunchAgents" "$ROOT/.data"
+# 升级旧版本时先卸载并移除原 Feishu Codex Bridge 服务。
+launchctl bootout "gui/$(id -u)/com.local.feishu-codex-bridge" 2>/dev/null || true
+rm -f "$LEGACY_PLIST"
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-<key>Label</key><string>com.local.feishu-codex-bridge</string>
+<key>Label</key><string>com.local.codexreach</string>
 <key>ProgramArguments</key><array><string>$NODE</string><string>$ROOT/dist/src/server.js</string></array>
 <key>WorkingDirectory</key><string>$ROOT</string>
 <key>EnvironmentVariables</key><dict>
@@ -22,6 +26,6 @@ cat > "$PLIST" <<EOF
 <key>StandardErrorPath</key><string>$ROOT/.data/bridge.error.log</string>
 </dict></plist>
 EOF
-launchctl bootout "gui/$(id -u)/com.local.feishu-codex-bridge" 2>/dev/null || true
+launchctl bootout "gui/$(id -u)/com.local.codexreach" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 echo "已安装并启动。日志：$ROOT/.data/bridge.log"

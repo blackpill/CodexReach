@@ -1,4 +1,4 @@
-# Feishu Codex Bridge
+# CodexReach
 
 在飞书手机端查看和控制 Mac 上的真实 Codex Projects 与 Sessions。系统通过 Codex App Server 共享同一份 Thread 数据，支持 Computer Use、Browser Use 和实时执行事件。
 
@@ -13,14 +13,32 @@
 - `/status` 服务与任务状态、`/doctor` 脱敏诊断
 - Codex App Server 自动重连、任务空闲超时保护
 - JSONL 结构化日志与自动清理
+- SQLite 状态库，保存群聊、话题、文档绑定、同步游标及 Session/Turn/event_id 关联
 - 飞书 doc/docx 文档绑定：在评论中 `@Bot` 创建独立 Codex Session，并将执行结果回写文档评论
 - 飞书长连接机器人，无需公网回调地址
 - 每个 Codex Project 自动对应一个飞书话题消息群
 - 每个 Codex Session 自动对应群内一个独立话题，对话历史与上下文严格隔离
+- Codex Desktop 中新增的 Session 与完成回合自动增量同步到对应飞书话题
 - 所有自动创建的项目群均使用 `CodexReach｜` 群名前缀作为可见标签
 - Safari 手机控制台、二维码配对、Bearer Token 校验
 - `approvalPolicy=never` 与 `dangerFullAccess` 完全自动模式
 - macOS 登录后自动启动
+
+## 事件关联与通知去重
+
+CodexReach 为从飞书发起的每个 Turn 写入统一关联信息：
+
+```text
+event_id = codex:<event_type>:<session_id>:<turn_id>
+session_id
+turn_id
+notification_id
+origin = codexreach
+```
+
+状态保存在 `CODEXREACH_STATE_DB` 指定的 SQLite 数据库中。首次启动会自动读取旧的 `.data/feishu-state.json` 并导入 SQLite，之后不再以 JSON 作为运行状态源。
+
+Codex 通知 Hook 会查询同一个 `turn_correlations` 表：由 CodexReach 发起的普通完成事件只更新原 Session 话题和任务卡片，不再向 Codex 通知群重复推送；失败、需要授权或需要人工关注的事件仍作为升级提醒发送。Codex Desktop 发起的 Turn 不受此规则影响。
 
 ## 安装
 
@@ -36,6 +54,8 @@ npm start
 > Computer Use 首次使用时，仍需在 macOS「隐私与安全性」中允许辅助功能与屏幕录制。这是系统权限，无法由应用绕过。
 
 ## 飞书机器人
+
+应用名称使用 **CodexReach**。推荐在飞书开放平台上传仓库中的醒目头像：[`assets/codexreach-avatar.png`](assets/codexreach-avatar.png)。名称与头像属于飞书应用资料，需要在开放平台修改并发布新版本后才会对群聊生效。
 
 1. 在飞书开放平台创建企业自建应用并开启机器人。
 2. 开启长连接事件订阅，订阅 `im.message.receive_v1`。
@@ -72,6 +92,7 @@ FEISHU_ALLOWED_OPEN_IDS=ou_xxx
 - 在已有 Session 话题内发送消息，只会继续该话题绑定的 Session。
 - 已开通群消息事件权限，在 CodexReach 话题内可直接发送命令，无需 `@Bot`。
 - Bot 的执行结果始终回复到原话题，不会进入其他 Session 的消息历史。
+- Desktop 端新建或继续的会话会在约 10 秒内同步；启动时只建立历史基线，不会把全部旧消息重新刷入群聊。
 
 ## 云文档评论
 
@@ -93,8 +114,8 @@ chmod +x scripts/install-launch-agent.sh
 日志位于 `.data/bridge.log`。要取消自动启动：
 
 ```bash
-launchctl bootout "gui/$(id -u)/com.local.feishu-codex-bridge"
-rm "$HOME/Library/LaunchAgents/com.local.feishu-codex-bridge.plist"
+launchctl bootout "gui/$(id -u)/com.local.codexreach"
+rm "$HOME/Library/LaunchAgents/com.local.codexreach.plist"
 ```
 
 ## 安全说明
