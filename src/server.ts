@@ -9,6 +9,8 @@ import { AuthStore } from './auth.js';
 import { FeishuGateway } from './feishu.js';
 import { groupProjects } from './types.js';
 import { logger } from './logger.js';
+import { ActionProcessor } from './evaluation/action-processor.js';
+import { EvaluationStore } from './evaluation/store.js';
 
 try { process.loadEnvFile(); } catch { /* .env 可选 */ }
 
@@ -17,10 +19,18 @@ const codex = new CodexClient(); const auth = new AuthStore();
 await auth.init(); await codex.start();
 await app.register(websocket);
 
+const evaluationStore = new EvaluationStore(
+  process.env.CODEXREACH_STATE_DB ? path.resolve(process.env.CODEXREACH_STATE_DB) : path.resolve('.data/feishu-state.sqlite'),
+);
+const evaluationProcessor = new ActionProcessor(codex, evaluationStore, {
+  enabled: process.env.EVALUATION_SYSTEM_ENABLED === 'true',
+});
+
 const sockets = new Set<any>();
 codex.on('notification', (event) => {
   const payload = JSON.stringify({ type: 'codex-event', event });
   for (const socket of sockets) if (socket.readyState === 1) socket.send(payload);
+  void evaluationProcessor.handleNotification(event);
 });
 codex.on('online', () => logger.info('codex_online'));
 codex.on('offline', () => logger.warn('codex_offline'));

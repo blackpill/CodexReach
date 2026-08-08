@@ -117,6 +117,15 @@ export class EvaluationStore {
     return row ? JSON.parse(row.value_json) as ActionCandidate : undefined;
   }
 
+  listActiveCandidates(projectId: string): ActionCandidate[] {
+    const rows = this.db.prepare(`
+      SELECT value_json FROM evaluation_action_candidates
+      WHERE project_id = ? AND status IN ('candidate', 'stale')
+      ORDER BY updated_at DESC
+    `).all(projectId) as JsonRow[];
+    return rows.map((row) => JSON.parse(row.value_json) as ActionCandidate);
+  }
+
   findCandidatesToAge(now: string): ActionCandidate[] {
     const rows = this.db.prepare(`
       SELECT value_json FROM evaluation_action_candidates

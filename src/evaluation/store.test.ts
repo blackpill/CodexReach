@@ -37,6 +37,7 @@ describe('EvaluationStore', () => {
     const store = createStore();
     store.saveCandidate(candidate);
     expect(store.getCandidate(candidate.id)).toEqual(candidate);
+    expect(store.listActiveCandidates(candidate.projectId)).toEqual([candidate]);
     expect(store.findCandidatesToAge('2026-08-30T23:59:59.000Z')).toEqual([]);
     expect(store.findCandidatesToAge('2026-08-31T00:00:00.000Z')).toEqual([candidate]);
 

@@ -26,6 +26,7 @@ const patterns = {
   seo: /\bSEO\b|title|description|canonical|structured data|schema\.org|sitemap|robots\.txt|内链|索引|重定向/i,
   release: /新功能|功能上线|性能优化|错误率|转化流程|支付流程|注册流程|缓存|基础设施|feature release|performance|conversion/i,
   followUp: /后续观察|稍后检查|需要评估|验证效果|观察效果|follow.?up|evaluate later|monitor/i,
+  completedAction: /已修改|已更新|已修复|已调整|已新增|已删除|改动完成|配置完成|implemented|updated|changed|fixed/i,
 };
 
 export function prefilterActionContext(context: TurnActionContext): PrefilterResult {
@@ -42,7 +43,12 @@ export function prefilterActionContext(context: TurnActionContext): PrefilterRes
 
   if (!text) return { eligible: false, score: 0, signals: ['query_only'], reasons: ['回合没有可判断的行动证据'] };
 
-  if (patterns.queryOnly.test(context.userIntent.trim()) && !context.git.changedFiles?.length && !patterns.deployment.test(text)) {
+  if (
+    patterns.queryOnly.test(context.userIntent.trim())
+    && !patterns.completedAction.test(context.agentResult)
+    && !patterns.deployment.test(context.agentResult)
+    && !patterns.productionChange.test(context.agentResult)
+  ) {
     signals.push('query_only');
     reasons.push('仅查询或解释，没有文件或部署证据');
     score -= 0.5;

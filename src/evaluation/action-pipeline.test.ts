@@ -38,7 +38,7 @@ describe('action collection and prefilter', () => {
     expect(prefilterActionContext(context({ turn: { id: 'turn-1', status: 'failed', items: [] } }))).toMatchObject({ eligible: false, signals: ['turn_failed'] });
     expect(prefilterActionContext(context({
       turn: { id: 'turn-1', status: 'completed', items: [{ type: 'userMessage', content: [{ type: 'inputText', text: '查看项目状态' }] }, { type: 'agentMessage', text: '项目正常。' }] },
-      git: {},
+      git: { headCommit: 'bbb', changedFiles: ['src/previous-change.ts'] },
     }))).toMatchObject({ eligible: false, signals: ['query_only'] });
   });
 });
