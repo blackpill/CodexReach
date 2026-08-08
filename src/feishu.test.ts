@@ -79,4 +79,30 @@ describe('评估草稿路由', () => {
     await expect(gateway.sendEvaluationDraft('/projects/site', 'session-1', draft)).resolves.toBe(true);
     expect(reply).toHaveBeenCalledWith(expect.objectContaining({ path: { message_id: 'root-1' } }));
   });
+
+  it('把评估节点创建到统一任务清单并分配负责人', async () => {
+    const createTask = vi.fn(async () => ({ code: 0, data: { task: { guid: 'task-1', url: 'https://example.test/task-1' } } }));
+    const gateway = new FeishuGateway({} as any) as any;
+    gateway.client = { task: { v2: { task: { create: createTask } } } };
+    gateway.evaluationTasklistGuid = 'tasklist-1';
+    const previous = process.env.EVALUATION_DEFAULT_ASSIGNEE_OPEN_ID;
+    process.env.EVALUATION_DEFAULT_ASSIGNEE_OPEN_ID = 'ou_owner';
+    try {
+      const nodes = await gateway.createEvaluationTasks({
+        projectName: 'classgames.net',
+        template: 'seo',
+        batch: { id: 'batch-1', projectId: 'project-1', candidateIds: ['candidate-1'], summary: '修改 title', effectiveAt: '2026-08-08T00:00:00.000Z', draftStatus: 'confirmed', createdAt: '2026-08-08T00:00:00.000Z', updatedAt: '2026-08-08T00:00:00.000Z' },
+        nodes: [{ id: 'node-1', planId: 'plan-1', purpose: '检查抓取与索引', dueAt: '2026-08-15T00:00:00.000Z', status: 'scheduled', reminderStage: 0, createdAt: '2026-08-08T00:00:00.000Z', updatedAt: '2026-08-08T00:00:00.000Z' }],
+      });
+      expect(nodes[0]).toMatchObject({ feishuTaskGuid: 'task-1', feishuTaskUrl: 'https://example.test/task-1' });
+      expect(createTask).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({
+        client_token: 'node-1',
+        members: [{ id: 'ou_owner', type: 'user', role: 'assignee' }],
+        tasklists: [{ tasklist_guid: 'tasklist-1' }],
+      }) }));
+    } finally {
+      if (previous === undefined) delete process.env.EVALUATION_DEFAULT_ASSIGNEE_OPEN_ID;
+      else process.env.EVALUATION_DEFAULT_ASSIGNEE_OPEN_ID = previous;
+    }
+  });
 });

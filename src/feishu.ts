@@ -7,6 +7,7 @@ import { groupProjects, type Project } from './types.js';
 import { logger } from './logger.js';
 import { codexEventId, StateStore } from './state-store.js';
 import type { EvaluationDraft } from './evaluation/batch-service.js';
+import type { ActionBatch, EvaluationNode } from './evaluation/types.js';
 
 type Card = { config: Record<string, unknown>; header: Record<string, unknown>; elements: Array<Record<string, unknown>> };
 type Reply = string | Card;
@@ -61,6 +62,8 @@ export class FeishuGateway {
   private syncedTurns = new Map<string, string[]>();
   private evaluationHubTopics = new Map<string, SessionTopic>();
   private evaluationDraftHandler?: EvaluationDraftHandler;
+  private evaluationTasklistGuid?: string;
+  private evaluationTasklistPromise?: Promise<string>;
   private client?: lark.Client;
   private watchdog?: NodeJS.Timeout;
   private desktopSyncTimer?: NodeJS.Timeout;
@@ -99,6 +102,52 @@ export class FeishuGateway {
     if (sent.code) throw new Error(`发送评估草稿失败：${sent.msg}`);
     logger.info('evaluation_draft_sent', { batchId: draft.batch.id, projectPath, sourceSessionId, rootMessageId: topic.rootMessageId });
     return true;
+  }
+
+  async createEvaluationTasks(input: {
+    projectName: string;
+    batch: ActionBatch;
+    template: string;
+    nodes: EvaluationNode[];
+  }): Promise<EvaluationNode[]> {
+    if (!this.client) throw new Error('飞书客户端尚未初始化');
+    const tasklistGuid = await this.ensureEvaluationTasklist(this.client);
+    const assignee = process.env.EVALUATION_DEFAULT_ASSIGNEE_OPEN_ID
+      || (process.env.FEISHU_ALLOWED_OPEN_IDS ?? '').split(',').map((item) => item.trim()).find(Boolean);
+    const updated: EvaluationNode[] = [];
+    for (const node of input.nodes) {
+      if (node.feishuTaskGuid) { updated.push(node); continue; }
+      const delayDays = Math.max(0, Math.round((Date.parse(node.dueAt) - Date.parse(input.batch.effectiveAt)) / 86_400_000));
+      const result = await this.client.task.v2.task.create({
+        params: { user_id_type: 'open_id' },
+        data: {
+          summary: `[效果评估] ${input.projectName}｜${input.template.toUpperCase()}｜${delayDays} 天`,
+          description: [
+            `原行动：${input.batch.summary}`,
+            `生产生效时间：${input.batch.effectiveAt}`,
+            `本次目标：${node.purpose}`,
+            `行动批次：${input.batch.id}`,
+            `评估节点：${node.id}`,
+            '到期后 CodexReach 会在原项目话题询问是否启动 Codex 评估。',
+          ].join('\n\n').slice(0, 3000),
+          due: { timestamp: String(Date.parse(node.dueAt)), is_all_day: false },
+          reminders: [{ relative_fire_minute: 0 }],
+          client_token: node.id,
+          tasklists: [{ tasklist_guid: tasklistGuid }],
+          members: assignee ? [{ id: assignee, type: 'user', role: 'assignee' }] : undefined,
+          extra: Buffer.from(JSON.stringify({ evaluationNodeId: node.id, batchId: input.batch.id })).toString('base64'),
+        },
+      });
+      const task = result.data?.task;
+      if (result.code || !task?.guid) throw new Error(`创建评估任务失败：${result.msg ?? '未返回任务 GUID'}`);
+      updated.push({
+        ...node,
+        feishuTaskGuid: task.guid,
+        feishuTaskUrl: task.url,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+    return updated;
   }
 
   start() {
@@ -804,6 +853,44 @@ export class FeishuGateway {
     return topic;
   }
 
+  private async ensureEvaluationTasklist(client: lark.Client): Promise<string> {
+    if (this.evaluationTasklistGuid) return this.evaluationTasklistGuid;
+    if (this.evaluationTasklistPromise) return this.evaluationTasklistPromise;
+    this.evaluationTasklistPromise = this.findOrCreateEvaluationTasklist(client);
+    try { return await this.evaluationTasklistPromise; }
+    finally { this.evaluationTasklistPromise = undefined; }
+  }
+
+  private async findOrCreateEvaluationTasklist(client: lark.Client): Promise<string> {
+    let pageToken: string | undefined;
+    do {
+      const result = await client.task.v2.tasklist.list({ params: { page_size: 100, page_token: pageToken } });
+      if (result.code) throw new Error(`查询评估任务清单失败：${result.msg}`);
+      const existing = result.data?.items?.find((item) => item.name === 'Codex 后续评估' && !item.archive_msec);
+      if (existing?.guid) {
+        this.evaluationTasklistGuid = existing.guid;
+        this.saveState();
+        return existing.guid;
+      }
+      pageToken = result.data?.has_more ? result.data.page_token : undefined;
+    } while (pageToken);
+
+    const assignee = process.env.EVALUATION_DEFAULT_ASSIGNEE_OPEN_ID
+      || (process.env.FEISHU_ALLOWED_OPEN_IDS ?? '').split(',').map((item) => item.trim()).find(Boolean);
+    const created = await client.task.v2.tasklist.create({
+      params: { user_id_type: 'open_id' },
+      data: {
+        name: 'Codex 后续评估',
+        members: assignee ? [{ id: assignee, type: 'user', role: 'editor' }] : undefined,
+      },
+    });
+    const guid = created.data?.tasklist?.guid;
+    if (created.code || !guid) throw new Error(`创建评估任务清单失败：${created.msg ?? '未返回清单 GUID'}`);
+    this.evaluationTasklistGuid = guid;
+    this.saveState();
+    return guid;
+  }
+
   private loadState() {
     try {
       const data = this.stateStore.loadSnapshot();
@@ -812,6 +899,7 @@ export class FeishuGateway {
       this.projectGroups = new Map(data.projectGroups ?? []);
       this.sessionTopics = new Map(data.sessionTopics ?? []);
       this.evaluationHubTopics = new Map(data.evaluationHubTopics ?? []);
+      this.evaluationTasklistGuid = (data.evaluationTasklistGuid ?? []).map((entry: any) => Array.isArray(entry) ? entry[1] : entry).find(Boolean);
       this.handledMessages = (data.handledMessages ?? []).map((entry: any) => Array.isArray(entry) ? entry[1] : entry);
       this.documentBindings = new Map(data.documentBindings ?? []);
       this.commentSessions = new Map(data.commentSessions ?? []);
@@ -827,6 +915,7 @@ export class FeishuGateway {
       selected: [...this.selected], targets: [...this.targets], projectGroups: [...this.projectGroups], sessionTopics: [...this.sessionTopics], evaluationHubTopics: [...this.evaluationHubTopics], handledMessages: this.handledMessages,
       documentBindings: [...this.documentBindings], commentSessions: [...this.commentSessions], commentTargets: [...this.commentTargets], commentQueues: [...this.commentQueues], handledComments: this.handledComments,
       syncedTurns: [...this.syncedTurns],
+      evaluationTasklistGuid: this.evaluationTasklistGuid ? [['guid', this.evaluationTasklistGuid]] : [],
     });
   }
 

@@ -50,6 +50,8 @@ export type ActionCandidate = {
 export type ActionBatch = {
   id: string;
   projectId: string;
+  projectPath?: string;
+  projectName?: string;
   candidateIds: string[];
   summary: string;
   effectiveAt: ISODateTime;
@@ -89,6 +91,7 @@ export type EvaluationNode = {
   status: EvaluationNodeStatus;
   reminderStage: 0 | 1 | 3 | 7;
   feishuTaskGuid?: string;
+  feishuTaskUrl?: string;
   sourceTopicId?: string;
   evaluationTopicId?: string;
   startedSessionId?: string;

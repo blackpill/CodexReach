@@ -12,6 +12,7 @@ import { logger } from './logger.js';
 import { ActionProcessor } from './evaluation/action-processor.js';
 import { EvaluationStore } from './evaluation/store.js';
 import { BatchService } from './evaluation/batch-service.js';
+import { PlanService } from './evaluation/plan-service.js';
 
 try { process.loadEnvFile(); } catch { /* .env 可选 */ }
 
@@ -24,9 +25,20 @@ const evaluationStore = new EvaluationStore(
   process.env.CODEXREACH_STATE_DB ? path.resolve(process.env.CODEXREACH_STATE_DB) : path.resolve('.data/feishu-state.sqlite'),
 );
 const evaluationBatchService = new BatchService(evaluationStore);
+const evaluationPlanService = new PlanService(evaluationStore);
 const feishu = new FeishuGateway(codex);
 feishu.setEvaluationDraftHandler(async (batchId, action) => {
-  evaluationBatchService.updateDraftStatus(batchId, action === 'confirm' ? 'confirmed' : 'ignored');
+  const batch = evaluationBatchService.updateDraftStatus(batchId, action === 'confirm' ? 'confirmed' : 'ignored');
+  if (action === 'confirm') {
+    const planned = evaluationPlanService.confirmBatch(batchId);
+    const taskNodes = await feishu.createEvaluationTasks({
+      projectName: batch.projectName || path.basename(batch.projectPath || '') || 'Codex 项目',
+      batch,
+      template: planned.plan.template,
+      nodes: planned.nodes,
+    });
+    for (const node of taskNodes) evaluationStore.saveNode(node);
+  }
   logger.info('evaluation_draft_action', { batchId, action });
 });
 const evaluationProcessor = new ActionProcessor(codex, evaluationStore, {

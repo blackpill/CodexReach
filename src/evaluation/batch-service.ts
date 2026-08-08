@@ -31,6 +31,8 @@ export class BatchService {
     const batch: ActionBatch = existing ?? {
       id: batchId,
       projectId: input.candidate.projectId,
+      projectPath: input.context.projectPath,
+      projectName: input.context.projectName,
       candidateIds: [input.candidate.id],
       summary: input.actions.map((action) => action.summary).join('；').slice(0, 1000),
       effectiveAt: now,

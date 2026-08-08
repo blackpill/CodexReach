@@ -8,6 +8,7 @@ import type {
   Deployment,
   EvaluationNode,
   EvaluationNodeStatus,
+  EvaluationPlan,
   OutboxEvent,
 } from './types.js';
 
@@ -78,6 +79,15 @@ export class EvaluationStore {
         value_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS evaluation_plans (
+        id TEXT PRIMARY KEY,
+        batch_id TEXT NOT NULL UNIQUE,
+        template TEXT NOT NULL,
+        value_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        confirmed_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS evaluation_nodes_status_due_idx
         ON evaluation_nodes(status, due_at);
@@ -246,6 +256,32 @@ export class EvaluationStore {
       node.createdAt,
       node.updatedAt,
     );
+  }
+
+  savePlan(plan: EvaluationPlan) {
+    this.db.prepare(`
+      INSERT INTO evaluation_plans(id, batch_id, template, value_json, created_at, confirmed_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        template = excluded.template,
+        value_json = excluded.value_json,
+        confirmed_at = excluded.confirmed_at
+    `).run(plan.id, plan.batchId, plan.template, JSON.stringify(plan), plan.createdAt, plan.confirmedAt);
+  }
+
+  getPlan(id: string): EvaluationPlan | undefined {
+    const row = this.db.prepare('SELECT value_json FROM evaluation_plans WHERE id = ?').get(id) as JsonRow | undefined;
+    return row ? JSON.parse(row.value_json) as EvaluationPlan : undefined;
+  }
+
+  getPlanByBatch(batchId: string): EvaluationPlan | undefined {
+    const row = this.db.prepare('SELECT value_json FROM evaluation_plans WHERE batch_id = ?').get(batchId) as JsonRow | undefined;
+    return row ? JSON.parse(row.value_json) as EvaluationPlan : undefined;
+  }
+
+  listNodesByPlan(planId: string): EvaluationNode[] {
+    const rows = this.db.prepare('SELECT value_json FROM evaluation_nodes WHERE plan_id = ? ORDER BY due_at').all(planId) as JsonRow[];
+    return rows.map((row) => JSON.parse(row.value_json) as EvaluationNode);
   }
 
   getNode(id: string): EvaluationNode | undefined {
