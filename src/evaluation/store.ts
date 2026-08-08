@@ -9,6 +9,7 @@ import type {
   EvaluationNode,
   EvaluationNodeStatus,
   EvaluationPlan,
+  EvaluationRun,
   OutboxEvent,
 } from './types.js';
 
@@ -104,6 +105,19 @@ export class EvaluationStore {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS evaluation_runs (
+        id TEXT PRIMARY KEY,
+        node_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        conclusion TEXT,
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        value_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS evaluation_runs_node_idx ON evaluation_runs(node_id, started_at);
+      CREATE UNIQUE INDEX IF NOT EXISTS evaluation_runs_session_idx ON evaluation_runs(session_id);
       CREATE INDEX IF NOT EXISTS evaluation_outbox_delivery_idx
         ON evaluation_outbox(status, next_retry_at);
     `);
@@ -312,6 +326,36 @@ export class EvaluationStore {
       LIMIT 1
     `).get(sessionId);
     return Boolean(row);
+  }
+
+  getNodeBySession(sessionId: string): EvaluationNode | undefined {
+    const row = this.db.prepare(`
+      SELECT value_json FROM evaluation_nodes
+      WHERE json_extract(value_json, '$.startedSessionId') = ?
+      LIMIT 1
+    `).get(sessionId) as JsonRow | undefined;
+    return row ? JSON.parse(row.value_json) as EvaluationNode : undefined;
+  }
+
+  saveRun(run: EvaluationRun) {
+    const updatedAt = run.finishedAt ?? run.startedAt;
+    this.db.prepare(`
+      INSERT INTO evaluation_runs(id, node_id, session_id, conclusion, started_at, finished_at, value_json, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        conclusion = excluded.conclusion,
+        finished_at = excluded.finished_at,
+        value_json = excluded.value_json,
+        updated_at = excluded.updated_at
+    `).run(
+      run.id, run.nodeId, run.sessionId, run.conclusion ?? null, run.startedAt,
+      run.finishedAt ?? null, JSON.stringify(run), updatedAt,
+    );
+  }
+
+  getRunBySession(sessionId: string): EvaluationRun | undefined {
+    const row = this.db.prepare('SELECT value_json FROM evaluation_runs WHERE session_id = ?').get(sessionId) as JsonRow | undefined;
+    return row ? JSON.parse(row.value_json) as EvaluationRun : undefined;
   }
 
   enqueue<T extends Record<string, unknown>>(event: OutboxEvent<T>): boolean {

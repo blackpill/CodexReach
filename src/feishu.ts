@@ -8,6 +8,7 @@ import { logger } from './logger.js';
 import { codexEventId, StateStore } from './state-store.js';
 import type { EvaluationDraft } from './evaluation/batch-service.js';
 import type { ActionBatch, EvaluationNode } from './evaluation/types.js';
+import type { ExtractedEvaluationResult } from './evaluation/result-extractor.js';
 
 type Card = { config: Record<string, unknown>; header: Record<string, unknown>; elements: Array<Record<string, unknown>> };
 type Reply = string | Card;
@@ -200,6 +201,42 @@ export class FeishuGateway {
       msg_type: 'text', content: JSON.stringify({ text: `${label}：评估任务尚未处理\n\n${input.node.purpose}\n\n请处理上方“评估任务已到期”卡片。` }),
     }});
     if (sent.code) throw new Error(`发送评估提醒失败：${sent.msg}`);
+    return true;
+  }
+
+  async sendEvaluationResult(input: {
+    projectPath: string;
+    sourceSessionId?: string;
+    projectName: string;
+    node: EvaluationNode;
+    result?: ExtractedEvaluationResult;
+    error?: string;
+    evaluationTopicId?: string;
+  }): Promise<boolean> {
+    if (!this.client) return false;
+    const group = this.projectGroups.get(input.projectPath);
+    if (!group) return false;
+    const topic = await this.resolveEvaluationTopic(this.client, group, input.sourceSessionId);
+    const conclusionLabels: Record<string, string> = {
+      effective: '倾向有效', negative: '倾向负向', no_material_change: '无明显变化',
+      insufficient_data: '数据不足', not_attributable: '无法归因', technical_issue: '技术异常',
+    };
+    const text = input.error
+      ? `⚠️ 评估执行失败\n\n项目：${input.projectName}\n目标：${input.node.purpose}\n原因：${input.error}`
+      : [
+          '✅ 后续评估已完成',
+          `项目：${input.projectName}`,
+          `目标：${input.node.purpose}`,
+          `结论：${conclusionLabels[input.result!.conclusion] ?? input.result!.conclusion}`,
+          `置信度：${Math.round(input.result!.confidence * 100)}%`,
+          `摘要：${input.result!.summary}`,
+          `建议：${input.result!.recommendation}`,
+          input.evaluationTopicId ? `评估话题 ID：${input.evaluationTopicId}` : '',
+        ].filter(Boolean).join('\n\n');
+    const sent = await this.client.im.message.reply({ path: { message_id: topic.rootMessageId }, data: {
+      msg_type: 'text', content: JSON.stringify({ text: text.slice(0, 3900) }),
+    }});
+    if (sent.code) throw new Error(`回写评估结果失败：${sent.msg}`);
     return true;
   }
 

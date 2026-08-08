@@ -14,6 +14,7 @@ import { EvaluationStore } from './evaluation/store.js';
 import { BatchService } from './evaluation/batch-service.js';
 import { PlanService } from './evaluation/plan-service.js';
 import { EvaluationScheduler } from './evaluation/scheduler.js';
+import { EvaluationResultProcessor } from './evaluation/result-processor.js';
 
 try { process.loadEnvFile(); } catch { /* .env 可选 */ }
 
@@ -82,6 +83,9 @@ feishu.setEvaluationDueHandler(async (nodeId, action) => {
     '3. 说明可能的混杂因素；',
     '4. 输出结构化结论与建议；',
     '5. 不要未经确认直接修改或回滚线上系统。',
+    '',
+    '最终回复必须包含一个 JSON 代码块：',
+    '{"conclusion":"effective|negative|no_material_change|insufficient_data|not_attributable|technical_issue","confidence":0.0,"summary":"...","recommendation":"...","evidence":{}}',
   ].join('\n');
   try {
     await feishu.startEvaluationSession({
@@ -137,12 +141,39 @@ const evaluationScheduler = new EvaluationScheduler(evaluationStore, {
     stage,
   }),
 });
+const evaluationResultProcessor = new EvaluationResultProcessor(codex, evaluationStore, {
+  enabled: process.env.EVALUATION_SYSTEM_ENABLED === 'true',
+  onCompleted: async ({ node, batch, result }) => {
+    if (!batch.projectPath) throw new Error(`Evaluation project path missing: ${batch.id}`);
+    await feishu.sendEvaluationResult({
+      projectPath: batch.projectPath,
+      sourceSessionId: batch.sourceSessionId,
+      projectName: batch.projectName || path.basename(batch.projectPath),
+      node,
+      result,
+      evaluationTopicId: node.evaluationTopicId,
+    });
+    await feishu.completeEvaluationTask(node.feishuTaskGuid);
+  },
+  onFailed: async ({ node, batch }, error) => {
+    if (!batch.projectPath) return;
+    await feishu.sendEvaluationResult({
+      projectPath: batch.projectPath,
+      sourceSessionId: batch.sourceSessionId,
+      projectName: batch.projectName || path.basename(batch.projectPath),
+      node,
+      error,
+      evaluationTopicId: node.evaluationTopicId,
+    });
+  },
+});
 
 const sockets = new Set<any>();
 codex.on('notification', (event) => {
   const payload = JSON.stringify({ type: 'codex-event', event });
   for (const socket of sockets) if (socket.readyState === 1) socket.send(payload);
   void evaluationProcessor.handleNotification(event);
+  void evaluationResultProcessor.handleNotification(event);
 });
 codex.on('online', () => logger.info('codex_online'));
 codex.on('offline', () => logger.warn('codex_offline'));
