@@ -1,6 +1,7 @@
 import * as lark from '@larksuiteoapi/node-sdk';
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import type { CodexClient } from './codex-client.js';
 import { groupProjects, type Project } from './types.js';
 import { logger } from './logger.js';
@@ -12,6 +13,8 @@ type SessionTopic = { sessionId: string; chatId: string; threadId: string; rootM
 type Target = { chatId: string; openId: string; rootMessageId?: string };
 type QueuedMessage = { text: string; target: Target; at: number };
 type TaskState = { startedAt: number; lastActivityAt: number; turnId?: string; cardMessageId?: string; status: 'queued' | 'running' | 'completed' | 'failed' | 'stopped' | 'timeout'; detail?: string; lastPrompt?: string };
+type DocumentBinding = { fileToken: string; fileType: 'doc' | 'docx'; url: string; projectPath: string; projectName: string };
+type CommentTarget = { fileToken: string; fileType: 'doc' | 'docx'; commentId: string; replyId?: string; openId: string };
 
 const CODEX_REACH_LABEL = 'CodexReach';
 
@@ -29,6 +32,11 @@ export class FeishuGateway {
   private projectsCache?: { at: number; projects: Project[] };
   private queues = new Map<string, QueuedMessage[]>();
   private tasks = new Map<string, TaskState>();
+  private documentBindings = new Map<string, DocumentBinding>();
+  private commentSessions = new Map<string, string>();
+  private commentTargets = new Map<string, CommentTarget>();
+  private commentQueues = new Map<string, string[]>();
+  private handledComments: string[] = [];
   private client?: lark.Client;
   private watchdog?: NodeJS.Timeout;
   private readonly stateFile = path.resolve('.data/feishu-state.json');
@@ -62,6 +70,11 @@ export class FeishuGateway {
 
         // Project 群中的一个飞书话题严格对应一个 Codex Session。
         const projectGroup = [...this.projectGroups.values()].find((group) => group.chatId === chatId);
+        if (projectGroup && /^\/(bind-doc|unbind-doc|docs)(?:\s|$)/.test(text)) {
+          const reply = await this.handle(openId, text, client, { chatId }).catch((error) => `执行失败：${formatFeishuError(error)}`);
+          await client.im.message.reply({ path: { message_id: rootMessageId }, data: { msg_type: 'text', content: JSON.stringify({ text: String(reply) }) } });
+          return;
+        }
         if (projectGroup && threadId) {
           try {
             let topic = [...this.sessionTopics.values()].find((item) => item.chatId === chatId && (
@@ -107,7 +120,7 @@ export class FeishuGateway {
           this.targets.set(selectedBeforeSend, { chatId, openId });
           this.saveState();
         }
-        const reply = await this.handle(openId, text, client).catch((error) => `执行失败：${formatFeishuError(error)}`);
+        const reply = await this.handle(openId, text, client, { chatId }).catch((error) => `执行失败：${formatFeishuError(error)}`);
         const selectedId = this.selected.get(openId);
         if (selectedId && (!text.startsWith('/') || text.startsWith('/new'))) {
           this.targets.set(selectedId, { chatId, openId });
@@ -159,6 +172,9 @@ export class FeishuGateway {
           return toastResponse('已加入执行队列', 'success');
         }
       },
+      'drive.notice.comment_add_v1': async (event: any) => {
+        await this.handleCommentEvent(client, event, allowed).catch((error) => logger.error('comment_event_failed', error));
+      },
     });
     this.codex.on('notification', async (notification: any) => {
       const threadId = notification.params?.threadId ?? notification.params?.thread?.id;
@@ -173,6 +189,12 @@ export class FeishuGateway {
         }
       }
       if (notification.method !== 'turn/completed') return;
+      const commentTarget = threadId ? this.commentTargets.get(threadId) : undefined;
+      if (threadId && commentTarget) {
+        await this.completeCommentRun(threadId, commentTarget, notification.params?.turn).catch((error) => logger.error('comment_reply_failed', error, { threadId }));
+        await this.runNextComment(threadId);
+        return;
+      }
       const target = threadId ? this.targets.get(threadId) : undefined;
       if (!target) return;
       try {
@@ -194,8 +216,33 @@ export class FeishuGateway {
     return true;
   }
 
-  async handle(user: string, input: string, client?: lark.Client): Promise<Reply> {
+  async handle(user: string, input: string, client?: lark.Client, context?: { chatId?: string }): Promise<Reply> {
     const [command, ...rest] = input.split(/\s+/);
+    if (command === '/bind-doc') {
+      const group = [...this.projectGroups.values()].find((item) => item.chatId === context?.chatId);
+      if (!group) return '请在已同步的 CodexReach Project 群中执行 /bind-doc <飞书文档链接>。';
+      const parsed = parseDocumentUrl(rest[0] ?? '');
+      if (!parsed) return '目前只支持 doc/docx 文档链接。\n用法：/bind-doc <飞书文档链接>';
+      const binding: DocumentBinding = { ...parsed, projectPath: group.projectPath, projectName: group.projectName };
+      this.documentBindings.set(parsed.fileToken, binding); this.saveState();
+      logger.info('document_bound', { fileToken: digest(parsed.fileToken), projectPath: group.projectPath });
+      return `文档已绑定到 Project：${group.projectName}\n${group.projectPath}\n\n之后在该文档评论中 @Bot 即可创建 Codex 任务。`;
+    }
+    if (command === '/unbind-doc') {
+      const parsed = parseDocumentUrl(rest[0] ?? '');
+      if (!parsed) return '用法：/unbind-doc <飞书文档链接>';
+      const binding = this.documentBindings.get(parsed.fileToken);
+      const group = [...this.projectGroups.values()].find((item) => item.chatId === context?.chatId);
+      if (!binding || !group || binding.projectPath !== group.projectPath) return '没有找到当前 Project 对该文档的绑定。';
+      this.documentBindings.delete(parsed.fileToken); this.saveState();
+      return '已解除文档绑定。';
+    }
+    if (command === '/docs') {
+      const group = [...this.projectGroups.values()].find((item) => item.chatId === context?.chatId);
+      if (!group) return '请在 CodexReach Project 群中使用 /docs。';
+      const bindings = [...this.documentBindings.values()].filter((item) => item.projectPath === group.projectPath);
+      return bindings.length ? `Project：${group.projectName}\n\n${bindings.map((item, index) => `${index + 1}. ${item.url}`).join('\n')}` : '当前 Project 尚未绑定飞书文档。';
+    }
     if (command === '/projects') {
       const projects = await this.getProjects(true);
       return projects.length ? projectCard(projects, 0) : '暂无项目';
@@ -276,7 +323,7 @@ export class FeishuGateway {
       return this.taskCard(thread.id);
     }
     if (command === '/stop') { const id = this.selected.get(user); if (!id) return '请先用 /use 选择 Session'; await this.stopTask(id); return '已发送停止指令'; }
-    if (command === '/help') return '/sync-project <项目名称|绝对路径|编号>：只同步一个 Project\n/sync-projects：同步全部 Project\n/projects：显示项目卡片\n/sessions：最近会话\n/use <session-id>\n/status [session-id]\n/doctor：运行诊断\n/new <绝对路径> <任务>\n/stop\n\n支持直接发送图片和文件；运行中的补充消息会自动排队。';
+    if (command === '/help') return '/sync-project <项目名称|绝对路径|编号>：只同步一个 Project\n/sync-projects：同步全部 Project\n/projects：显示项目卡片\n/sessions：最近会话\n/use <session-id>\n/status [session-id]\n/doctor：运行诊断\n/new <绝对路径> <任务>\n/stop\n/bind-doc <文档链接>：在项目群绑定文档\n/docs：查看项目绑定文档\n/unbind-doc <文档链接>\n\n支持直接发送图片和文件；运行中的补充消息会自动排队。';
     const id = this.selected.get(user); if (!id) return '请先发送 /sessions，再用 /use <session-id> 选择会话。';
     const target = this.targets.get(id) ?? { chatId: '', openId: user };
     await this.enqueue(id, input, target, false); return this.taskCard(id);
@@ -385,6 +432,134 @@ export class FeishuGateway {
     }
   }
 
+  private async handleCommentEvent(client: lark.Client, event: any, allowed: Set<string>) {
+    const fileToken = event.notice_meta?.file_token;
+    const fileType = event.notice_meta?.file_type;
+    const openId = event.notice_meta?.from_user_id?.open_id ?? '';
+    const commentId = event.comment_id;
+    const replyId = event.reply_id;
+    const dedupeKey = `${event.event_id ?? event.uuid ?? ''}:${fileToken}:${commentId}:${replyId ?? ''}`;
+    if (!event.is_mentioned || !fileToken || !commentId || !['doc', 'docx'].includes(fileType)) return;
+    if (!allowed.size || !allowed.has(openId)) {
+      logger.warn('comment_unauthorized', { openId, fileToken: digest(fileToken) });
+      return;
+    }
+    if (this.handledComments.includes(dedupeKey)) return;
+    const binding = this.documentBindings.get(fileToken);
+    // 事件中的 file_type 对新版文档仍可能返回旧值 `doc`，Drive API 则要求
+    // 与文档 URL 一致的 `docx`。已绑定文档以绑定时解析出的类型为准。
+    const apiFileType: 'doc' | 'docx' = binding?.fileType ?? fileType;
+    const target: CommentTarget = { fileToken, fileType: apiFileType, commentId, replyId, openId };
+    if (!binding) {
+      await this.postCommentReply(client, target, '该文档尚未绑定 Codex Project。请在目标 CodexReach Project 群中发送：\n/bind-doc <当前文档链接>');
+      this.markCommentHandled(dedupeKey);
+      return;
+    }
+    // 评论新增事件有时会先于 Drive 评论数据完成复制，短时间内读取会返回 400。
+    // 重试可避免把一次暂时性失败永久写入去重记录。
+    let response: Awaited<ReturnType<typeof client.drive.fileComment.get>> | undefined;
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      try {
+        response = await client.drive.fileComment.get({ path: { file_token: fileToken, comment_id: commentId }, params: { file_type: apiFileType, user_id_type: 'open_id' } });
+        break;
+      } catch (error) {
+        lastError = error;
+        if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, attempt * 750));
+      }
+    }
+    if (!response) throw lastError;
+    if (response.code) throw new Error(`读取评论失败：${response.msg}`);
+    const replies = response.data?.reply_list?.replies ?? [];
+    const targetReply = (replyId ? replies.find((item) => item.reply_id === replyId) : undefined) ?? replies.at(-1);
+    const question = commentElementsText(targetReply?.content?.elements ?? []);
+    if (!question) {
+      this.markCommentHandled(dedupeKey);
+      return;
+    }
+    const targetIndex = targetReply ? replies.indexOf(targetReply) : replies.length;
+    const priorReplies = replies.slice(0, Math.max(0, targetIndex)).map((item) => commentElementsText(item.content?.elements ?? [])).filter(Boolean).slice(-8);
+    const prompt = buildCommentPrompt(binding, question, response.data?.quote, priorReplies);
+    const scope = `${fileToken}:${commentId}`;
+    const existingSession = this.commentSessions.get(scope);
+    if (existingSession && this.tasks.get(existingSession)?.status === 'running') {
+      const queue = this.commentQueues.get(existingSession) ?? [];
+      queue.push(prompt); this.commentQueues.set(existingSession, queue); this.saveState();
+      await this.postCommentReply(client, target, `当前评论线程已有任务运行，本条已排队（前方 ${queue.length - 1} 条）。`);
+      this.markCommentHandled(dedupeKey);
+      return;
+    }
+    let sessionId = existingSession;
+    if (sessionId) {
+      await this.codex.send(sessionId, prompt);
+    } else {
+      const thread = await this.codex.create(binding.projectPath, prompt);
+      sessionId = thread.id;
+      this.commentSessions.set(scope, thread.id);
+    }
+    if (!sessionId) throw new Error('未能创建评论 Session');
+    this.commentTargets.set(sessionId, target);
+    this.tasks.set(sessionId, { startedAt: Date.now(), lastActivityAt: Date.now(), status: 'running', lastPrompt: prompt });
+    this.markCommentHandled(dedupeKey);
+    this.saveState();
+    logger.info('comment_run_started', { threadId: sessionId, fileToken: digest(fileToken), projectPath: binding.projectPath });
+  }
+
+  private markCommentHandled(dedupeKey: string) {
+    if (!this.handledComments.includes(dedupeKey)) this.handledComments.push(dedupeKey);
+    this.handledComments = this.handledComments.slice(-500);
+    this.saveState();
+  }
+
+  private async completeCommentRun(threadId: string, target: CommentTarget, turn?: any) {
+    const state = this.tasks.get(threadId);
+    const failed = turn?.status === 'failed';
+    const answer = extractAgentAnswer(turn) || state?.detail || (failed ? '任务执行失败，请稍后重试。' : '任务已完成。');
+    const prefix = failed ? '⚠️ Codex 执行失败\n\n' : '✅ Codex 已完成\n\n';
+    await this.postCommentReply(this.client!, target, `${prefix}${answer}`.slice(0, 1900));
+    logger.info('comment_run_completed', { threadId, status: turn?.status ?? 'completed' });
+  }
+
+  private async runNextComment(threadId: string) {
+    const queue = this.commentQueues.get(threadId);
+    if (!queue?.length) return;
+    const prompt = queue.shift()!;
+    if (!queue.length) this.commentQueues.delete(threadId);
+    this.saveState();
+    const state: TaskState = { startedAt: Date.now(), lastActivityAt: Date.now(), status: 'running', lastPrompt: prompt };
+    this.tasks.set(threadId, state);
+    try { await this.codex.send(threadId, prompt); }
+    catch (error) {
+      state.status = 'failed'; state.detail = formatCodexSubmitError(error);
+      const target = this.commentTargets.get(threadId);
+      if (target && this.client) await this.postCommentReply(this.client, target, `⚠️ 排队任务启动失败\n\n${state.detail}`);
+    }
+  }
+
+  private async postCommentReply(client: lark.Client, target: CommentTarget, text: string) {
+    const content = { elements: [{ type: 'text_run' as const, text_run: { text: text.slice(0, 2000) } }] };
+    try {
+      const result = await client.drive.fileCommentReply.create({
+        path: { file_token: target.fileToken, comment_id: target.commentId },
+        params: { file_type: target.fileType, user_id_type: 'open_id' },
+        data: { content },
+      });
+      if (result.code) throw new Error(`回复评论失败：${result.msg}`);
+    } catch (error: any) {
+      const code = error?.response?.data?.code;
+      if (code !== 1069302) throw error;
+      // 部分新版文档允许创建全文评论，但关闭了评论内回复。此时退化为
+      // 新建一条全文评论，确保接收确认和最终结果仍能回写到同一文档。
+      const result = await client.drive.fileComment.create({
+        path: { file_token: target.fileToken },
+        params: { file_type: target.fileType, user_id_type: 'open_id' },
+        data: { reply_list: { replies: [{ content }] } },
+      });
+      if (result.code) throw new Error(`创建回执评论失败：${result.msg}`);
+      logger.warn('comment_reply_fallback_created', { commentId: target.commentId, fallbackCommentId: result.data?.comment_id });
+    }
+  }
+
   private ensureMediaDir() {
     const dir = path.resolve('.data/media');
     fs.mkdirSync(dir, { recursive: true });
@@ -477,12 +652,20 @@ export class FeishuGateway {
       this.projectGroups = new Map(data.projectGroups ?? []);
       this.sessionTopics = new Map(data.sessionTopics ?? []);
       this.handledMessages = data.handledMessages ?? [];
+      this.documentBindings = new Map(data.documentBindings ?? []);
+      this.commentSessions = new Map(data.commentSessions ?? []);
+      this.commentTargets = new Map(data.commentTargets ?? []);
+      this.commentQueues = new Map(data.commentQueues ?? []);
+      this.handledComments = data.handledComments ?? [];
     } catch { /* 首次启动 */ }
   }
 
   private saveState() {
     fs.mkdirSync(path.dirname(this.stateFile), { recursive: true });
-    fs.writeFileSync(this.stateFile, JSON.stringify({ selected: [...this.selected], targets: [...this.targets], projectGroups: [...this.projectGroups], sessionTopics: [...this.sessionTopics], handledMessages: this.handledMessages }, null, 2));
+    fs.writeFileSync(this.stateFile, JSON.stringify({
+      selected: [...this.selected], targets: [...this.targets], projectGroups: [...this.projectGroups], sessionTopics: [...this.sessionTopics], handledMessages: this.handledMessages,
+      documentBindings: [...this.documentBindings], commentSessions: [...this.commentSessions], commentTargets: [...this.commentTargets], commentQueues: [...this.commentQueues], handledComments: this.handledComments,
+    }, null, 2));
   }
 }
 
@@ -578,4 +761,35 @@ function formatCodexSubmitError(error: unknown): string {
     return '该 Session 正被另一个 Codex 客户端占用，暂时无法写入。请关闭正在占用此 Session 的 Codex 任务后重试。';
   }
   return `错误详情：${detail}\n请稍后重试；若持续失败，请检查桥接服务日志。`;
+}
+
+export function parseDocumentUrl(value: string): Pick<DocumentBinding, 'fileToken' | 'fileType' | 'url'> | null {
+  try {
+    const url = new URL(value);
+    const match = url.pathname.match(/\/(docx|docs)\/([A-Za-z0-9_-]+)/);
+    if (!match) return null;
+    return { fileToken: match[2], fileType: match[1] === 'docs' ? 'doc' : 'docx', url: `${url.origin}${url.pathname}` };
+  } catch { return null; }
+}
+
+function digest(value: string) { return createHash('sha256').update(value).digest('hex').slice(0, 16); }
+
+function commentElementsText(elements: Array<any>): string {
+  return elements.map((item) => item.text_run?.text ?? item.docs_link?.url ?? '').join('').trim();
+}
+
+function buildCommentPrompt(binding: DocumentBinding, question: string, quote?: string, priorReplies: string[] = []): string {
+  return [
+    '状态：已接收，正在交给 Codex 处理。',
+    '以下任务来自飞书文档评论。请在当前项目中处理，并在最终回复中简要列出修改内容、测试结果和需要人工确认的事项。',
+    `文档：${binding.url}`,
+    quote ? `评论引用内容：\n${quote}` : '',
+    priorReplies.length ? `评论线程此前讨论：\n${priorReplies.map((item) => `- ${item}`).join('\n')}` : '',
+    `本次要求：\n${question}`,
+  ].filter(Boolean).join('\n\n');
+}
+
+function extractAgentAnswer(turn: any): string {
+  const item = [...(turn?.items ?? [])].reverse().find((entry: any) => entry.type === 'agentMessage' && entry.text);
+  return String(item?.text ?? '').trim();
 }

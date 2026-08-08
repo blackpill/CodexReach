@@ -13,6 +13,7 @@
 - `/status` 服务与任务状态、`/doctor` 脱敏诊断
 - Codex App Server 自动重连、任务空闲超时保护
 - JSONL 结构化日志与自动清理
+- 飞书 doc/docx 文档绑定：在评论中 `@Bot` 创建独立 Codex Session，并将执行结果回写文档评论
 - 飞书长连接机器人，无需公网回调地址
 - 每个 Codex Project 自动对应一个飞书话题消息群
 - 每个 Codex Session 自动对应群内一个独立话题，对话历史与上下文严格隔离
@@ -58,6 +59,9 @@ FEISHU_ALLOWED_OPEN_IDS=ou_xxx
 - `/stop`：停止当前任务
 - `/status [session-id]`：查看服务或任务状态
 - `/doctor`：运行不包含凭据的连接与目录诊断
+- `/bind-doc <文档链接>`：在 CodexReach Project 群中绑定 doc/docx 文档
+- `/docs`：查看当前 Project 已绑定文档
+- `/unbind-doc <文档链接>`：解除当前 Project 的文档绑定
 - `/help`：查看帮助
 - 选择 Session 后，普通文字会直接作为下一轮任务发送。
 
@@ -68,6 +72,16 @@ FEISHU_ALLOWED_OPEN_IDS=ou_xxx
 - 在已有 Session 话题内发送消息，只会继续该话题绑定的 Session。
 - 已开通群消息事件权限，在 CodexReach 话题内可直接发送命令，无需 `@Bot`。
 - Bot 的执行结果始终回复到原话题，不会进入其他 Session 的消息历史。
+
+## 云文档评论
+
+在飞书开放平台为应用订阅 `drive.notice.comment_add_v1`，并授予读取评论与 `docs:document.comment:create` 权限，重新发布应用版本。然后：
+
+1. 在目标 `CodexReach｜项目名` 群中发送 `/bind-doc <飞书文档链接>`。
+2. 在已绑定的 doc/docx 文档评论里 `@Bot` 并写明任务。
+3. Bot 在绑定 Project 中创建或续接该评论对应的 Codex Session；接收状态只显示在 Codex 会话中，完成后才将结果回写文档评论。若文档关闭了评论内回复，结果会作为新的全文评论写入。
+
+文档未绑定时不会执行；评论人仍必须在 `FEISHU_ALLOWED_OPEN_IDS` 中。当前不支持 Wiki、表格、多维表格和幻灯片链接。
 
 ## 自动启动
 
