@@ -119,7 +119,10 @@ export class BaseSyncService {
         '数据来源': input.plan.template === 'seo' ? 'Google Search Console / 页面检查' : '人工补充',
         '状态': nodeStatusLabels[node.status] ?? node.status,
         '飞书任务GUID': node.feishuTaskGuid ?? '',
-        '飞书任务链接': node.feishuTaskUrl ?? '',
+        // Base 的 URL 字段不能直接写字符串，必须使用 { link, text }。
+        '飞书任务链接': node.feishuTaskUrl
+          ? { link: node.feishuTaskUrl, text: '打开飞书任务' }
+          : undefined,
         '原话题ID': node.sourceTopicId ?? input.batch.sourceTopicId ?? '',
         '评估话题ID': node.evaluationTopicId ?? '',
         '提醒阶段': node.reminderStage,

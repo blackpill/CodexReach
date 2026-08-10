@@ -75,7 +75,11 @@ feishu.setEvaluationDraftHandler(async (batchId, action) => {
       nodes: planned.nodes,
     });
     for (const node of taskNodes) evaluationStore.saveNode(node);
-    await syncPlanToBase(batchId);
+    // Base 同步是附属持久化，失败不能让飞书卡片回调整体失败；否则飞书会
+    // 显示 200671，用户重试按钮时还会重复执行已经成功的任务创建流程。
+    await syncPlanToBase(batchId).catch((error) => {
+      logger.error('evaluation_base_sync_failed', error, { batchId });
+    });
   }
   logger.info('evaluation_draft_action', { batchId, action });
 });

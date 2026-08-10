@@ -77,6 +77,12 @@ FEISHU_ALLOWED_OPEN_IDS=ou_xxx
 - `/use <session-id>`：选择 Session
 - `/new <绝对路径> <任务>`：创建真实 Session
 - `/stop`：停止当前任务
+- `/retry`：重试上一条失败或中断的任务
+- `/continue [指令]`：恢复任务；运行中使用时作为 same-turn steering 追加指令
+- `/model [模型 ID]`：卡片选择或直接设置当前 Session 模型
+- `/mode [default|plan]`：切换默认执行或先规划模式
+- `/diff`：用 Git 卡片查看未提交变更
+- `/commit [提交说明]`：预览变更并通过卡片确认本地 Commit（不 Push）
 - `/status [session-id]`：查看服务或任务状态
 - `/doctor`：运行不包含凭据的连接与目录诊断
 - `/bind-doc <文档链接>`：在 CodexReach Project 群中绑定 doc/docx 文档
@@ -84,6 +90,15 @@ FEISHU_ALLOWED_OPEN_IDS=ou_xxx
 - `/unbind-doc <文档链接>`：解除当前 Project 的文档绑定
 - `/help`：查看帮助
 - 选择 Session 后，普通文字会直接作为下一轮任务发送。
+- 直接发送飞书图片、音频或文件时，Bot 会下载到本地附件目录；图片/音频转为 Codex 原生多模态输入，其他文件转为文件 mention。
+- 消息中可用 `@相对路径` 引用当前 Project 内的文件，例如 `检查 @src/server.ts`；路径含空格时使用 `@"docs/my file.md"`。
+- 消息中可用 `$技能名` 调用当前 Project 可用的已安装 Codex Skill，例如 `$audit 检查这个项目`。
+- `/files [关键词]` 和 `/skills [关键词]` 会返回可点击候选卡片；可连续选择多个项目，然后直接发送任务内容。
+- `/context` 查看已经选择、等待随下一条任务发送的上下文，可逐项移除；`/context clear` 全部清空。选择会保存到 SQLite，30 分钟未使用自动过期，任务发送成功后自动清空。
+- `/apps [关键词]` 读取 Codex App Server 的 App/Connector 列表，显示可调用、待安装或待授权状态；可调用 App 能加入 Context，未授权 App 提供安装/授权入口。
+- `/plan` 查看当前 Session 最近的 Codex Plan；`/plan <任务>` 要求 Codex 先制定计划。
+- `/goal` 查看原生 Codex Goal；支持 `/goal create <目标> [--budget 数字]`、`/goal pause|resume|complete|clear`。
+- Plan 卡片会随 Codex 的步骤更新自动刷新并显示完成进度；Goal 卡片可直接暂停、恢复、完成或清除。两类卡片状态和消息关联均保存到 SQLite，服务重启后仍可继续刷新。
 
 首次配置权限并发布应用后，在机器人单聊中发送 `/sync-projects`。之后：
 

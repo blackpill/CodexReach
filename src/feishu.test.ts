@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import { FeishuGateway, formatDesktopTurn, parseDocumentUrl, parseNewCommand } from './feishu.js';
+import { FeishuGateway, formatDesktopTurn, formatDesktopTurnMessages, parseDocumentUrl, parseNewCommand, searchProjectFiles } from './feishu.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import type { EvaluationDraft } from './evaluation/batch-service.js';
 
 describe('parseNewCommand', () => {
@@ -33,6 +36,58 @@ describe('parseDocumentUrl', () => {
   });
 });
 
+describe('searchProjectFiles', () => {
+  it('按关键词搜索项目文件并忽略依赖目录', () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'codexreach-files-'));
+    fs.mkdirSync(path.join(cwd, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(cwd, 'node_modules'), { recursive: true });
+    fs.writeFileSync(path.join(cwd, 'src', 'server.ts'), '');
+    fs.writeFileSync(path.join(cwd, 'node_modules', 'server.js'), '');
+    expect(searchProjectFiles(cwd, 'server')).toEqual(['src/server.ts']);
+  });
+});
+
+describe('待发送上下文', () => {
+  it('生成任务引用时不会提前删除，便于发送失败后重试', () => {
+    const gateway = new FeishuGateway({} as any) as any;
+    gateway.pendingReferences = new Map([['session-1:user-1', [{ type: 'file', value: 'docs/my file.md', selectedAt: Date.now() }]]]);
+    expect(gateway.applyPendingReferences('session-1', 'user-1', '检查内容')).toBe('@"docs/my file.md"\n检查内容');
+    expect(gateway.pendingReferences.get('session-1:user-1')).toHaveLength(1);
+  });
+
+  it('自动忽略超过 30 分钟的选择', () => {
+    const gateway = new FeishuGateway({} as any) as any;
+    gateway.pendingReferences = new Map([['session-1:user-1', [{ type: 'skill', value: 'audit', selectedAt: Date.now() - 31 * 60_000 }]]]);
+    expect(gateway.applyPendingReferences('session-1', 'user-1', '检查内容')).toBe('检查内容');
+  });
+
+  it('把 App 选择转换成 Codex Connector 引用', () => {
+    const gateway = new FeishuGateway({} as any) as any;
+    gateway.pendingReferences = new Map([['session-1:user-1', [{ type: 'app', value: 'google-drive', label: 'Google Drive', selectedAt: Date.now() }]]]);
+    expect(gateway.applyPendingReferences('session-1', 'user-1', '查找文件')).toBe('[$Google Drive](app://google-drive)\n查找文件');
+  });
+});
+
+describe('Plan 与 Goal 卡片', () => {
+  it('Plan 卡片显示完成进度和刷新按钮', async () => {
+    const gateway = new FeishuGateway({} as any) as any;
+    gateway.plans = new Map([['session-1', { plan: [{ step: '分析', status: 'completed' }, { step: '实现', status: 'inProgress' }] }]]);
+    const result = await gateway.handleSessionControl('session-1', '/plan', { chatId: 'chat-1', openId: 'user-1' });
+    expect(result.header.title.content).toBe('Codex · Plan（1/2）');
+    expect(JSON.stringify(result)).toContain('刷新计划');
+  });
+
+  it('Goal 卡片根据进行中状态显示暂停、完成和清除按钮', async () => {
+    const goal = { threadId: 'session-1', objective: '完成测试', status: 'active', tokenBudget: 1000, tokensUsed: 20, timeUsedSeconds: 60, createdAt: 1, updatedAt: 1 };
+    const gateway = new FeishuGateway({ getGoal: async () => goal } as any) as any;
+    const result = await gateway.handleSessionControl('session-1', '/goal', { chatId: 'chat-1', openId: 'user-1' });
+    const content = JSON.stringify(result);
+    expect(content).toContain('暂停');
+    expect(content).toContain('完成');
+    expect(content).toContain('清除');
+  });
+});
+
 describe('formatDesktopTurn', () => {
   it('格式化 Desktop 的用户消息与最终回复', () => {
     expect(formatDesktopTurn({ items: [
@@ -40,9 +95,32 @@ describe('formatDesktopTurn', () => {
       { type: 'agentMessage', text: '检查完成。' },
     ] })).toContain('你：\n检查项目\n\nCodex：\n检查完成。');
   });
+
+  it('长请求与长结果分段发送且结果不会被截掉', () => {
+    const messages = formatDesktopTurnMessages({ items: [
+      { type: 'userMessage', content: [{ type: 'text', text: '请求'.repeat(2200) }] },
+      { type: 'agentMessage', text: `最终结论-${'结果'.repeat(2200)}` },
+    ] }, 1000);
+    expect(messages.length).toBeGreaterThan(2);
+    expect(messages.join('')).toContain('最终结论-');
+    expect(messages.at(-1)).toContain('结果');
+    expect(messages.every((item) => item.length <= 1000)).toBe(true);
+  });
 });
 
 describe('Desktop Session 同步', () => {
+  it('优先从历史 target 恢复话题，避免再次同步时创建重复话题', async () => {
+    const gateway = new FeishuGateway({} as any) as any;
+    gateway.targets = new Map([['session-1', { chatId: 'chat-1', openId: 'user-1', rootMessageId: 'root-1' }]]);
+    gateway.sessionTopics = new Map();
+    const group = { projectPath: '/project', projectName: 'Project', chatId: 'chat-1' };
+
+    const topic = gateway.restoreSessionTopicFromTarget(group, 'session-1');
+
+    expect(topic).toEqual({ sessionId: 'session-1', chatId: 'chat-1', threadId: '', rootMessageId: 'root-1' });
+    expect(gateway.sessionTopics.get('session-1')).toEqual(topic);
+  });
+
   it('启动建立基线时不会自动创建历史 Session 话题', async () => {
     const codex = {
       listThreads: async () => [{ id: 'session-1', cwd: '/project', name: '历史任务', preview: '', turns: [] }],

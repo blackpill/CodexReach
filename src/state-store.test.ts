@@ -28,4 +28,23 @@ describe('StateStore', () => {
     expect(store.isCodexReachTurn('session-1', 'turn-1')).toBe(true);
     store.close();
   });
+
+  it('does not let a stale process erase or overwrite newer bindings', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexreach-state-'));
+    dirs.push(dir);
+    const legacy = path.join(dir, 'feishu-state.json');
+    const database = path.join(dir, 'feishu-state.sqlite');
+    fs.writeFileSync(legacy, JSON.stringify({ projectGroups: [['/old', { chatId: 'old' }]] }));
+    const stale = new StateStore(database, legacy);
+    const current = new StateStore(database, legacy);
+
+    current.saveSnapshot({ projectGroups: [['/old', { chatId: 'new' }], ['/new', { chatId: 'added' }]] });
+    stale.saveSnapshot({ projectGroups: [] });
+
+    expect(current.loadSnapshot().projectGroups).toEqual(expect.arrayContaining([
+      ['/old', { chatId: 'new' }],
+      ['/new', { chatId: 'added' }],
+    ]));
+    stale.close(); current.close();
+  });
 });

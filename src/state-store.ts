@@ -20,6 +20,7 @@ export function codexEventId(sessionId: string, turnId: string, eventType: strin
 
 export class StateStore {
   private readonly db: Database.Database;
+  private baseline = new Map<string, string>();
 
   constructor(
     readonly databasePath = path.resolve('.data/feishu-state.sqlite'),
@@ -31,6 +32,7 @@ export class StateStore {
     this.db.pragma('foreign_keys = ON');
     this.migrate();
     this.importLegacyJsonOnce();
+    this.captureBaseline();
   }
 
   close() { this.db.close(); }
@@ -72,8 +74,29 @@ export class StateStore {
     if (this.db.prepare('SELECT 1 FROM migrations WHERE name = ?').get(migration)) return;
     let snapshot: PersistedState = {};
     try { snapshot = JSON.parse(fs.readFileSync(this.legacyJsonPath, 'utf8')); } catch { /* no legacy state */ }
-    this.saveSnapshot(snapshot);
+    this.replaceSnapshot(snapshot);
     this.db.prepare('INSERT INTO migrations(name, applied_at) VALUES (?, ?)').run(migration, new Date().toISOString());
+  }
+
+  private captureBaseline() {
+    this.baseline = new Map((this.db.prepare('SELECT namespace, entry_key, value_json FROM state_entries').all() as Array<{ namespace: string; entry_key: string; value_json: string }>)
+      .map((row) => [`${row.namespace}\0${row.entry_key}`, row.value_json]));
+  }
+
+  private replaceSnapshot(snapshot: PersistedState) {
+    const write = this.db.transaction(() => {
+      const now = new Date().toISOString();
+      const insert = this.db.prepare('INSERT OR REPLACE INTO state_entries(namespace, entry_key, value_json, updated_at) VALUES (?, ?, ?, ?)');
+      for (const [namespace, rawEntries] of Object.entries(snapshot)) {
+        const entries = Array.isArray(rawEntries) ? rawEntries : [];
+        for (let index = 0; index < entries.length; index++) {
+          const entry = entries[index];
+          const [key, value] = Array.isArray(entry) && entry.length === 2 ? [String(entry[0]), entry[1]] : [String(index), entry];
+          insert.run(namespace, key, JSON.stringify(value), now);
+        }
+      }
+    });
+    write();
   }
 
   loadSnapshot(): PersistedState {
@@ -89,22 +112,32 @@ export class StateStore {
   saveSnapshot(snapshot: PersistedState) {
     const write = this.db.transaction(() => {
       const now = new Date().toISOString();
-      const upsert = this.db.prepare(`
-        INSERT INTO state_entries(namespace, entry_key, value_json, updated_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(namespace, entry_key) DO UPDATE SET
-          value_json = excluded.value_json,
-          updated_at = excluded.updated_at
-      `);
+      const insert = this.db.prepare('INSERT OR IGNORE INTO state_entries(namespace, entry_key, value_json, updated_at) VALUES (?, ?, ?, ?)');
+      const update = this.db.prepare('UPDATE state_entries SET value_json = ?, updated_at = ? WHERE namespace = ? AND entry_key = ? AND value_json = ?');
+      const remove = this.db.prepare('DELETE FROM state_entries WHERE namespace = ? AND entry_key = ? AND value_json = ?');
       for (const [namespace, rawEntries] of Object.entries(snapshot)) {
-        this.db.prepare('DELETE FROM state_entries WHERE namespace = ?').run(namespace);
         const entries = Array.isArray(rawEntries) ? rawEntries : [];
+        const desired = new Map<string, string>();
         for (let index = 0; index < entries.length; index++) {
           const entry = entries[index];
           const [key, value] = Array.isArray(entry) && entry.length === 2
             ? [String(entry[0]), entry[1]]
             : [String(index), entry];
-          upsert.run(namespace, key, JSON.stringify(value), now);
+          desired.set(key, JSON.stringify(value));
+        }
+        for (const [key, valueJson] of desired) {
+          const baselineKey = `${namespace}\0${key}`;
+          const previous = this.baseline.get(baselineKey);
+          if (previous === valueJson) continue;
+          const result = previous === undefined
+            ? insert.run(namespace, key, valueJson, now)
+            : update.run(valueJson, now, namespace, key, previous);
+          if (result.changes) this.baseline.set(baselineKey, valueJson);
+        }
+        for (const [baselineKey, previous] of [...this.baseline]) {
+          const [previousNamespace, key] = baselineKey.split('\0');
+          if (previousNamespace !== namespace || desired.has(key)) continue;
+          if (remove.run(namespace, key, previous).changes) this.baseline.delete(baselineKey);
         }
       }
     });

@@ -2,7 +2,8 @@ import * as lark from '@larksuiteoapi/node-sdk';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import type { CodexClient } from './codex-client.js';
+import { execFileSync } from 'node:child_process';
+import type { CodexClient, ThreadGoal } from './codex-client.js';
 import { groupProjects, type Project } from './types.js';
 import { logger } from './logger.js';
 import { codexEventId, StateStore } from './state-store.js';
@@ -17,6 +18,8 @@ type SessionTopic = { sessionId: string; chatId: string; threadId: string; rootM
 type Target = { chatId: string; openId: string; rootMessageId?: string };
 type QueuedMessage = { text: string; target: Target; at: number };
 type TaskState = { startedAt: number; lastActivityAt: number; turnId?: string; cardMessageId?: string; status: 'queued' | 'running' | 'completed' | 'failed' | 'stopped' | 'timeout'; detail?: string; lastPrompt?: string };
+type PlanState = { explanation?: string | null; plan: Array<{ step: string; status: 'pending' | 'inProgress' | 'completed' }> };
+type PendingReference = { type: 'file' | 'skill' | 'app'; value: string; label?: string; selectedAt: number };
 type DocumentBinding = { fileToken: string; fileType: 'doc' | 'docx'; url: string; projectPath: string; projectName: string };
 type CommentTarget = { fileToken: string; fileType: 'doc' | 'docx'; commentId: string; replyId?: string; openId: string };
 type EvaluationDraftHandler = (batchId: string, action: 'confirm' | 'ignore') => Promise<void> | void;
@@ -56,6 +59,13 @@ export class FeishuGateway {
   private projectsCache?: { at: number; projects: Project[] };
   private queues = new Map<string, QueuedMessage[]>();
   private tasks = new Map<string, TaskState>();
+  private plans = new Map<string, PlanState>();
+  private goals = new Map<string, ThreadGoal>();
+  private planCardMessages = new Map<string, string>();
+  private goalCardMessages = new Map<string, string>();
+  private controlCardTimers = new Map<string, NodeJS.Timeout>();
+  private pendingReferences = new Map<string, PendingReference[]>();
+  private sessionOptions = new Map<string, { model?: string; mode?: 'default' | 'plan' }>();
   private documentBindings = new Map<string, DocumentBinding>();
   private commentSessions = new Map<string, string>();
   private commentTargets = new Map<string, CommentTarget>();
@@ -305,7 +315,17 @@ export class FeishuGateway {
         if (!text) return;
 
         // Project 群中的一个飞书话题严格对应一个 Codex Session。
-        const projectGroup = [...this.projectGroups.values()].find((group) => group.chatId === chatId);
+        let projectGroup = [...this.projectGroups.values()].find((group) => group.chatId === chatId);
+        if (!projectGroup && threadId) {
+          const recovery = await this.recoverProjectBinding(chatId, rawThreadId, rootMessageId);
+          projectGroup = recovery.group;
+          if (!projectGroup && recovery.candidates.length) {
+            await client.im.message.reply({ path: { message_id: rootMessageId }, data: {
+              msg_type: 'interactive', content: JSON.stringify(projectBindingRecoveryCard(chatId, recovery.candidates)),
+            }});
+            return;
+          }
+        }
         if (projectGroup && /^\/(bind-doc|unbind-doc|docs)(?:\s|$)/.test(text)) {
           const reply = await this.handle(openId, text, client, { chatId }).catch((error) => `执行失败：${formatFeishuError(error)}`);
           await client.im.message.reply({ path: { message_id: rootMessageId }, data: { msg_type: 'text', content: JSON.stringify({ text: String(reply) }) } });
@@ -331,7 +351,18 @@ export class FeishuGateway {
             }
             this.targets.set(topic.sessionId, { chatId, openId, rootMessageId: topic.rootMessageId });
             this.saveState();
-            await this.enqueue(topic.sessionId, text, { chatId, openId, rootMessageId: topic.rootMessageId }, true);
+            if (/^\/(plan|goal|files|skills|apps|context|stop|model|mode|sessions|diff|commit|retry|continue)(?:\s|$)/.test(text)) {
+              const reply = await this.handleSessionControl(topic.sessionId, text, { chatId, openId, rootMessageId: topic.rootMessageId });
+              const sent = await client.im.message.reply({ path: { message_id: topic.rootMessageId }, data: {
+                msg_type: typeof reply === 'string' ? 'text' : 'interactive',
+                content: JSON.stringify(typeof reply === 'string' ? { text: reply } : reply),
+              }});
+              this.rememberControlCard(topic.sessionId, text, sent.data?.message_id);
+              return;
+            }
+            const enriched = this.applyPendingReferences(topic.sessionId, openId, text);
+            await this.enqueue(topic.sessionId, enriched, { chatId, openId, rootMessageId: topic.rootMessageId }, true);
+            this.clearPendingReferences(topic.sessionId, openId);
           } catch (error) {
             console.error('[feishu-submit]', error);
             const detail = formatCodexSubmitError(error);
@@ -371,6 +402,7 @@ export class FeishuGateway {
         if (typeof reply !== 'string' && selectedId) {
           const state = this.tasks.get(selectedId);
           if (state && (sentReply as any).data?.message_id) state.cardMessageId = (sentReply as any).data.message_id;
+          this.rememberControlCard(selectedId, text, (sentReply as any).data?.message_id);
         }
       },
       'card.action.trigger': async (event: any) => {
@@ -379,6 +411,28 @@ export class FeishuGateway {
         const value = event.action?.value ?? {};
         const projects = await this.getProjects();
         if (value.action === 'projects_page') return cardResponse(projectCard(projects, Number(value.page) || 0));
+        if (value.action === 'project_sync') {
+          const project = projects.find((item) => item.path === value.projectPath);
+          if (!project) return toastResponse('项目不存在或已移动', 'error');
+          const group = await this.ensureProjectGroup(client, project, openId);
+          let created = 0;
+          for (const session of project.sessions) {
+            if (!this.sessionTopics.has(session.id) && !this.restoreSessionTopicFromTarget(group, session.id)) {
+              await this.ensureSessionTopic(client, group, session.id, session.name || session.preview || '未命名 Session');
+              created++;
+            }
+          }
+          this.saveState();
+          return toastResponse('已同步 ' + project.name + '，新增 ' + created + ' 个 Session 话题', 'success');
+        }
+        if (value.action === 'bind_project_confirm') {
+          const project = projects.find((item) => item.path === value.projectPath);
+          if (!project || !value.chatId) return toastResponse('项目不存在或群信息已失效', 'error');
+          this.projectGroups.set(project.path, { projectPath: project.path, projectName: project.name, chatId: value.chatId });
+          this.saveState();
+          logger.info('project_binding_confirmed', { projectPath: project.path, chatId: value.chatId });
+          return toastResponse(`已将当前群绑定到 ${project.name}，请重新发送刚才的消息`, 'success');
+        }
         if (value.action === 'project_sessions') {
           const project = projects.find((item) => item.path === value.projectPath);
           return project ? cardResponse(sessionCard(project, Number(value.page) || 0)) : toastResponse('项目不存在或已移动', 'error');
@@ -408,6 +462,55 @@ export class FeishuGateway {
           await this.enqueue(value.sessionId, state.lastPrompt, target, false);
           return toastResponse('已加入执行队列', 'success');
         }
+        if (value.action === 'model_select') {
+          this.setSessionOptions(value.sessionId, { model: value.model });
+          return toastResponse(`已选择模型：${value.model}`, 'success');
+        }
+        if (value.action === 'mode_select') {
+          this.setSessionOptions(value.sessionId, { mode: value.mode });
+          return toastResponse(`已切换为 ${value.mode === 'plan' ? 'Plan' : 'Default'} 模式`, 'success');
+        }
+        if (value.action === 'git_commit_confirm') {
+          const thread = await this.codex.readThread(value.sessionId);
+          const message = String(value.message || 'chore: update from Feishu');
+          execFileSync('git', ['add', '-A'], { cwd: thread.cwd });
+          const output = execFileSync('git', ['commit', '-m', message], { cwd: thread.cwd, encoding: 'utf8' });
+          return toastResponse(output.split('\n')[0] || '已创建 Commit', 'success');
+        }
+        if (value.action === 'reference_select') {
+          const key = `${value.sessionId}:${openId}`;
+          const refs = this.pendingReferences.get(key) ?? [];
+          const reference: PendingReference = { type: value.referenceType, value: value.referenceValue, label: value.referenceLabel, selectedAt: Date.now() };
+          if (!refs.some((item) => item.type === reference.type && item.value === reference.value)) refs.push(reference);
+          this.pendingReferences.set(key, refs.slice(-10));
+          this.saveState();
+          return toastResponse(`已选择 ${formatReference(reference)}，请继续发送任务内容`, 'success');
+        }
+        if (value.action === 'reference_remove') {
+          const key = `${value.sessionId}:${openId}`;
+          const refs = (this.pendingReferences.get(key) ?? []).filter((item) => !(item.type === value.referenceType && item.value === value.referenceValue));
+          if (refs.length) this.pendingReferences.set(key, refs); else this.pendingReferences.delete(key);
+          this.saveState();
+          return cardResponse(contextCard(value.sessionId, refs));
+        }
+        if (value.action === 'reference_clear') {
+          this.clearPendingReferences(value.sessionId, openId);
+          return cardResponse(contextCard(value.sessionId, []));
+        }
+        if (value.action === 'plan_refresh') return cardResponse(planCard(value.sessionId, this.plans.get(value.sessionId)));
+        if (['goal_pause', 'goal_resume', 'goal_complete', 'goal_clear'].includes(value.action)) {
+          if (value.action === 'goal_clear') {
+            await this.codex.clearGoal(value.sessionId);
+            this.goals.delete(value.sessionId);
+            this.saveState();
+            return cardResponse(goalCard(value.sessionId, null));
+          }
+          const status = value.action === 'goal_pause' ? 'paused' : value.action === 'goal_resume' ? 'active' : 'complete';
+          const goal = await this.codex.setGoal(value.sessionId, { status });
+          this.goals.set(value.sessionId, goal);
+          this.saveState();
+          return cardResponse(goalCard(value.sessionId, goal));
+        }
         if (value.action === 'evaluation_draft_confirm' || value.action === 'evaluation_draft_ignore') {
           if (!this.evaluationDraftHandler) return toastResponse('评估系统尚未启用', 'error');
           await this.evaluationDraftHandler(value.batchId, value.action === 'evaluation_draft_confirm' ? 'confirm' : 'ignore');
@@ -427,6 +530,19 @@ export class FeishuGateway {
     });
     this.codex.on('notification', async (notification: any) => {
       const threadId = notification.params?.threadId ?? notification.params?.thread?.id;
+      if (threadId && notification.method === 'turn/plan/updated') {
+        this.plans.set(threadId, { explanation: notification.params?.explanation, plan: notification.params?.plan ?? [] });
+        this.saveState();
+        this.scheduleControlCardUpdate('plan', threadId);
+      }
+      if (threadId && notification.method === 'thread/goal/updated' && notification.params?.goal) {
+        this.goals.set(threadId, notification.params.goal);
+        this.saveState();
+        this.scheduleControlCardUpdate('goal', threadId);
+      }
+      if (threadId && notification.method === 'thread/goal/cleared') {
+        this.goals.delete(threadId); this.saveState(); this.scheduleControlCardUpdate('goal', threadId);
+      }
       if (threadId) {
         const state = this.tasks.get(threadId);
         if (state) {
@@ -513,15 +629,19 @@ export class FeishuGateway {
         if (!pending.length) continue;
         const topic = topicBeforeSync ?? await this.ensureSessionTopic(this.client, group, thread.id, thread.name || thread.preview || '未命名 Session');
         for (const turn of pending) {
-          const text = formatDesktopTurn(turn);
-          if (!text) {
+          const messages = formatDesktopTurnMessages(turn);
+          if (!messages.length) {
             logger.warn('desktop_turn_content_not_loaded', { sessionId: thread.id, turnId: turn.id, itemTypes: turn.items.map((item: any) => item.type) });
             continue;
           }
-          const sent = await this.client.im.message.reply({ path: { message_id: topic.rootMessageId }, data: {
-            msg_type: 'text', content: JSON.stringify({ text: text.slice(0, 3900) }),
-          }});
-          logger.info('desktop_turn_synced', { sessionId: thread.id, turnId: turn.id, messageId: sent.data?.message_id, rootMessageId: topic.rootMessageId });
+          const messageIds: string[] = [];
+          for (const text of messages) {
+            const sent = await this.client.im.message.reply({ path: { message_id: topic.rootMessageId }, data: {
+              msg_type: 'text', content: JSON.stringify({ text }),
+            }});
+            if (sent.data?.message_id) messageIds.push(sent.data.message_id);
+          }
+          logger.info('desktop_turn_synced', { sessionId: thread.id, turnId: turn.id, messageIds, messageCount: messages.length, rootMessageId: topic.rootMessageId });
           this.markTurnSynced(thread.id, turn.id);
         }
       }
@@ -580,7 +700,7 @@ export class FeishuGateway {
         const group = await this.ensureProjectGroup(client, project, user);
         let created = 0;
         for (const session of project.sessions) {
-          if (!this.sessionTopics.has(session.id)) {
+          if (!this.sessionTopics.has(session.id) && !this.restoreSessionTopicFromTarget(group, session.id)) {
             await this.ensureSessionTopic(client, group, session.id, session.name || session.preview || '未命名 Session');
             created++;
           }
@@ -604,7 +724,7 @@ export class FeishuGateway {
       const group = await this.ensureProjectGroup(client, project, user);
       let created = 0;
       for (const session of project.sessions) {
-        if (!this.sessionTopics.has(session.id)) {
+        if (!this.sessionTopics.has(session.id) && !this.restoreSessionTopicFromTarget(group, session.id)) {
           await this.ensureSessionTopic(client, group, session.id, session.name || session.preview || '未命名 Session');
           created++;
         }
@@ -648,10 +768,181 @@ export class FeishuGateway {
       return this.taskCard(thread.id);
     }
     if (command === '/stop') { const id = this.selected.get(user); if (!id) return '请先用 /use 选择 Session'; await this.stopTask(id); return '已发送停止指令'; }
-    if (command === '/help') return '/sync-project <项目名称|绝对路径|编号>：只同步一个 Project\n/sync-projects：同步全部 Project\n/projects：显示项目卡片\n/sessions：最近会话\n/use <session-id>\n/status [session-id]\n/doctor：运行诊断\n/new <绝对路径> <任务>\n/stop\n/bind-doc <文档链接>：在项目群绑定文档\n/docs：查看项目绑定文档\n/unbind-doc <文档链接>\n\n支持直接发送图片和文件；运行中的补充消息会自动排队。';
+    if (['/plan', '/goal', '/files', '/skills', '/apps', '/context', '/model', '/mode', '/sessions', '/diff', '/commit', '/retry', '/continue'].includes(command)) {
+      const id = this.selected.get(user); if (!id) return '请先用 /use 选择 Session';
+      return this.handleSessionControl(id, input, this.targets.get(id) ?? { chatId: '', openId: user });
+    }
+    if (command === '/help') return '/sessions：查看和切换 Session\n/stop：中止当前任务\n/retry：重试上一条任务\n/continue [指令]：恢复失败任务或向运行中任务追加指令\n/model [模型 ID]：查看或选择模型\n/mode [default|plan]：切换执行模式\n/diff：查看 Git 变更\n/commit [提交说明]：预览并确认提交\n/files、/skills、/apps、/context、/plan、/goal：上下文与计划控制\n\n支持直接发送飞书图片、文件、@相对路径 和 $Skill。';
     const id = this.selected.get(user); if (!id) return '请先发送 /sessions，再用 /use <session-id> 选择会话。';
     const target = this.targets.get(id) ?? { chatId: '', openId: user };
-    await this.enqueue(id, input, target, false); return this.taskCard(id);
+    const enriched = this.applyPendingReferences(id, user, input);
+    await this.enqueue(id, enriched, target, false);
+    this.clearPendingReferences(id, user);
+    return this.taskCard(id);
+  }
+
+  private async handleSessionControl(sessionId: string, input: string, target: Target): Promise<Reply> {
+    const [command, action = '', ...rest] = input.trim().split(/\s+/);
+    if (command === '/stop') { await this.stopTask(sessionId); return '已发送停止指令。'; }
+    if (command === '/retry') {
+      const state = this.tasks.get(sessionId);
+      if (!state?.lastPrompt) return '没有可重试的上一条任务。';
+      await this.enqueue(sessionId, state.lastPrompt, target, true); return this.taskCard(sessionId);
+    }
+    if (command === '/continue') {
+      const instruction = [action, ...rest].join(' ').trim() || '继续上一个任务，从中断或失败处恢复，不要重复已完成的工作。';
+      const state = this.tasks.get(sessionId);
+      if (state?.status === 'running') await this.codex.steer(sessionId, instruction);
+      else await this.enqueue(sessionId, instruction, target, true);
+      return this.taskCard(sessionId);
+    }
+    if (command === '/model') {
+      if (action) {
+        const model = (await this.codex.listModels()).find((item) => item.id === action || item.model === action);
+        if (!model) return `未找到模型：${action}`;
+        this.setSessionOptions(sessionId, { model: model.model });
+        return `已选择模型：${model.displayName}（${model.model}）`;
+      }
+      return modelCard(sessionId, await this.codex.listModels(), this.codex.getSessionOptions(sessionId).model);
+    }
+    if (command === '/mode') {
+      if (action === 'plan' || action === 'default') {
+        this.setSessionOptions(sessionId, { mode: action });
+        return `已切换为 ${action === 'plan' ? 'Plan' : 'Default'} 模式。`;
+      }
+      return modeCard(sessionId, this.codex.getSessionOptions(sessionId).mode ?? 'default');
+    }
+    if (command === '/sessions') {
+      const thread = await this.codex.readThread(sessionId);
+      const project = (await this.getProjects()).find((item) => item.path === thread.cwd);
+      return project ? sessionCard(project, 0) : '当前项目没有可用 Session。';
+    }
+    if (command === '/diff') {
+      const thread = await this.codex.readThread(sessionId);
+      let output = execFileSync('git', ['diff', '--stat'], { cwd: thread.cwd, encoding: 'utf8' }).trim();
+      const detail = execFileSync('git', ['diff', '--no-ext-diff', '--unified=2'], { cwd: thread.cwd, encoding: 'utf8', maxBuffer: 1024 * 1024 }).trim();
+      if (!output && !detail) return gitDiffCard(sessionId, '当前没有未提交变更。');
+      return gitDiffCard(sessionId, `${output}\n\n${detail}`.slice(0, 12000));
+    }
+    if (command === '/commit') {
+      const message = [action, ...rest].join(' ').trim() || 'chore: update from Feishu';
+      const thread = await this.codex.readThread(sessionId);
+      const status = execFileSync('git', ['status', '--short'], { cwd: thread.cwd, encoding: 'utf8' }).trim();
+      if (!status) return '当前没有可提交变更。';
+      return commitCard(sessionId, message, status);
+    }
+    if (command === '/context') {
+      if (action === 'clear') {
+        this.clearPendingReferences(sessionId, target.openId);
+        return contextCard(sessionId, []);
+      }
+      return contextCard(sessionId, this.getPendingReferences(sessionId, target.openId));
+    }
+    if (command === '/files') {
+      const thread = await this.codex.readThread(sessionId);
+      const files = searchProjectFiles(thread.cwd, [action, ...rest].join(' ').trim());
+      return referenceCard('文件', sessionId, files.map((value) => ({ type: 'file' as const, value })));
+    }
+    if (command === '/skills') {
+      const thread = await this.codex.readThread(sessionId);
+      const query = [action, ...rest].join(' ').trim().toLowerCase();
+      const skills = (await this.codex.listSkills(thread.cwd)).filter((item) => item.enabled !== false && (!query || item.name.toLowerCase().includes(query) || item.description?.toLowerCase().includes(query))).slice(0, 20);
+      return referenceCard('Skills', sessionId, skills.map((item) => ({ type: 'skill' as const, value: item.name, description: item.description })));
+    }
+    if (command === '/apps') {
+      const query = [action, ...rest].join(' ').trim().toLowerCase();
+      // App discovery is catalog-level and must keep working when a persisted Feishu
+      // session has not yet been restored into the freshly restarted App Server.
+      const apps = await this.codex.listApps(undefined, { query, limit: 20 });
+      return appCard(sessionId, apps);
+    }
+    if (command === '/plan') {
+      const task = input.slice('/plan'.length).trim();
+      if (task) {
+        const prompt = `请先进入规划：使用 update_plan 制定清晰的分步计划；除非为了制定可执行计划所必需，否则先不要修改文件或执行实现。\n\n任务：${task}`;
+        await this.enqueue(sessionId, prompt, target, true);
+        return this.taskCard(sessionId);
+      }
+      return planCard(sessionId, this.plans.get(sessionId));
+    }
+    if (command !== '/goal') return '不支持的控制命令。';
+    if (!action || action === 'show') {
+      const goal = await this.codex.getGoal(sessionId);
+      if (goal) this.goals.set(sessionId, goal);
+      return goalCard(sessionId, goal);
+    }
+    if (action === 'create' || action === 'set') {
+      const raw = rest.join(' ');
+      const budgetMatch = raw.match(/(?:^|\s)--budget\s+(\d+)(?:\s|$)/);
+      const objective = raw.replace(/(?:^|\s)--budget\s+\d+(?=\s|$)/, ' ').trim();
+      if (!objective) return '用法：/goal create <目标> [--budget 数字]';
+      const goal = await this.codex.setGoal(sessionId, { objective, status: 'active', tokenBudget: budgetMatch ? Number(budgetMatch[1]) : undefined });
+      this.goals.set(sessionId, goal);
+      return goalCard(sessionId, goal);
+    }
+    if (action === 'clear') {
+      await this.codex.clearGoal(sessionId); this.goals.delete(sessionId);
+      return 'Goal 已清除。';
+    }
+    const statuses: Record<string, ThreadGoal['status']> = { pause: 'paused', resume: 'active', complete: 'complete' };
+    if (statuses[action]) {
+      const goal = await this.codex.setGoal(sessionId, { status: statuses[action] });
+      this.goals.set(sessionId, goal);
+      return goalCard(sessionId, goal);
+    }
+    return '用法：/goal；/goal create <目标> [--budget 数字]；/goal pause|resume|complete|clear';
+  }
+
+  private getPendingReferences(sessionId: string, openId: string): PendingReference[] {
+    const key = `${sessionId}:${openId}`;
+    const cutoff = Date.now() - 30 * 60_000;
+    const refs = (this.pendingReferences.get(key) ?? []).filter((item) => (item.selectedAt ?? Date.now()) >= cutoff);
+    if (refs.length) this.pendingReferences.set(key, refs); else this.pendingReferences.delete(key);
+    return refs;
+  }
+
+  private applyPendingReferences(sessionId: string, openId: string, text: string): string {
+    const refs = this.getPendingReferences(sessionId, openId);
+    if (!refs.length) return text;
+    const prefix = refs.map(formatReference).join(' ');
+    return `${prefix}\n${text}`;
+  }
+
+  private clearPendingReferences(sessionId: string, openId: string) {
+    this.pendingReferences.delete(`${sessionId}:${openId}`);
+    this.saveState();
+  }
+
+  private setSessionOptions(sessionId: string, options: { model?: string; mode?: 'default' | 'plan' }) {
+    const next = { ...(this.sessionOptions.get(sessionId) ?? {}), ...options };
+    this.sessionOptions.set(sessionId, next);
+    this.codex.setSessionOptions(sessionId, next);
+    this.saveState();
+  }
+
+  private rememberControlCard(sessionId: string, input: string, messageId?: string) {
+    if (!messageId) return;
+    if (/^\/plan(?:\s|$)/.test(input)) this.planCardMessages.set(sessionId, messageId);
+    if (/^\/goal(?:\s|$)/.test(input)) this.goalCardMessages.set(sessionId, messageId);
+    this.saveState();
+  }
+
+  private scheduleControlCardUpdate(type: 'plan' | 'goal', sessionId: string) {
+    if (!this.client) return;
+    const key = `${type}:${sessionId}`;
+    clearTimeout(this.controlCardTimers.get(key));
+    this.controlCardTimers.set(key, setTimeout(() => {
+      this.controlCardTimers.delete(key);
+      void this.updateControlCard(type, sessionId).catch((error) => logger.error('control_card_update_failed', error, { type, sessionId }));
+    }, 900));
+  }
+
+  private async updateControlCard(type: 'plan' | 'goal', sessionId: string) {
+    if (!this.client) return;
+    const messageId = (type === 'plan' ? this.planCardMessages : this.goalCardMessages).get(sessionId);
+    if (!messageId) return;
+    const content = type === 'plan' ? planCard(sessionId, this.plans.get(sessionId)) : goalCard(sessionId, this.goals.get(sessionId) ?? null);
+    await (this.client.im.message as any).patch({ path: { message_id: messageId }, data: { content: JSON.stringify(content) } });
   }
 
   private async enqueue(sessionId: string, text: string, target: Target, createCard = true) {
@@ -931,6 +1222,34 @@ export class FeishuGateway {
     return projects;
   }
 
+  private async recoverProjectBinding(chatId: string, threadId: string, rootMessageId: string): Promise<{ group?: ProjectGroup; candidates: Project[] }> {
+    const evidence = new Set<string>();
+    for (const [sessionId, target] of this.targets) {
+      if (target.chatId !== chatId) continue;
+      try { evidence.add((await this.codex.readThread(sessionId)).cwd); } catch { /* 历史会话可能已归档或不可读 */ }
+    }
+    for (const topic of this.sessionTopics.values()) {
+      if (topic.chatId !== chatId) continue;
+      try { evidence.add((await this.codex.readThread(topic.sessionId)).cwd); } catch { /* 同上 */ }
+    }
+    const projects = await this.getProjects(true);
+    const candidates = projects.filter((project) => evidence.has(project.path));
+    if (candidates.length !== 1) {
+      logger.warn('project_binding_recovery_ambiguous', { chatId, candidatePaths: candidates.map((item) => item.path), evidencePaths: [...evidence] });
+      return { candidates: candidates.length ? candidates : projects.slice(0, 20) };
+    }
+    const project = candidates[0];
+    const group = { projectPath: project.path, projectName: project.name, chatId };
+    this.projectGroups.set(project.path, group);
+    for (const [sessionId, target] of this.targets) {
+      if (target.chatId !== chatId || target.rootMessageId !== rootMessageId) continue;
+      this.sessionTopics.set(sessionId, { sessionId, chatId, threadId, rootMessageId });
+    }
+    this.saveState();
+    logger.info('project_binding_recovered', { projectPath: project.path, chatId, evidenceCount: evidence.size });
+    return { group, candidates };
+  }
+
   private async ensureProjectGroup(client: lark.Client, project: Project, ownerOpenId: string): Promise<ProjectGroup> {
     const existing = this.projectGroups.get(project.path);
     if (existing) {
@@ -960,6 +1279,8 @@ export class FeishuGateway {
   private async ensureSessionTopic(client: lark.Client, group: ProjectGroup, sessionId: string, title: string): Promise<SessionTopic> {
     const existing = this.sessionTopics.get(sessionId);
     if (existing) return existing;
+    const restored = this.restoreSessionTopicFromTarget(group, sessionId);
+    if (restored) return restored;
     const sent = await client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: {
       receive_id: group.chatId,
       msg_type: 'text',
@@ -969,6 +1290,16 @@ export class FeishuGateway {
     if (sent.code || !sent.data?.message_id || !sent.data.thread_id) throw new Error(`创建 Session 话题失败：${sent.msg ?? '未返回 thread_id'}`);
     const topic = { sessionId, chatId: group.chatId, threadId: sent.data.thread_id, rootMessageId: sent.data.message_id };
     this.sessionTopics.set(sessionId, topic);
+    return topic;
+  }
+
+  private restoreSessionTopicFromTarget(group: ProjectGroup, sessionId: string): SessionTopic | undefined {
+    const target = this.targets.get(sessionId);
+    if (!target?.rootMessageId || target.chatId !== group.chatId) return undefined;
+    // 历史 target 已保存飞书话题根消息。即使 thread_id 丢失，rootMessageId 也足以稳定路由回复。
+    const topic = { sessionId, chatId: group.chatId, threadId: '', rootMessageId: target.rootMessageId };
+    this.sessionTopics.set(sessionId, topic);
+    logger.info('session_topic_recovered', { sessionId, chatId: group.chatId, rootMessageId: target.rootMessageId });
     return topic;
   }
 
@@ -1047,6 +1378,13 @@ export class FeishuGateway {
       this.commentQueues = new Map(data.commentQueues ?? []);
       this.handledComments = (data.handledComments ?? []).map((entry: any) => Array.isArray(entry) ? entry[1] : entry);
       this.syncedTurns = new Map(data.syncedTurns ?? []);
+      this.pendingReferences = new Map(data.pendingReferences ?? []);
+      this.plans = new Map(data.plans ?? []);
+      this.goals = new Map(data.goals ?? []);
+      this.planCardMessages = new Map(data.planCardMessages ?? []);
+      this.goalCardMessages = new Map(data.goalCardMessages ?? []);
+      this.sessionOptions = new Map(data.sessionOptions ?? []);
+      for (const [sessionId, options] of this.sessionOptions) this.codex.setSessionOptions(sessionId, options);
     } catch { /* 首次启动 */ }
   }
 
@@ -1055,6 +1393,9 @@ export class FeishuGateway {
       selected: [...this.selected], targets: [...this.targets], projectGroups: [...this.projectGroups], sessionTopics: [...this.sessionTopics], evaluationHubTopics: [...this.evaluationHubTopics], handledMessages: this.handledMessages,
       documentBindings: [...this.documentBindings], commentSessions: [...this.commentSessions], commentTargets: [...this.commentTargets], commentQueues: [...this.commentQueues], handledComments: this.handledComments,
       syncedTurns: [...this.syncedTurns],
+      pendingReferences: [...this.pendingReferences],
+      plans: [...this.plans], goals: [...this.goals], planCardMessages: [...this.planCardMessages], goalCardMessages: [...this.goalCardMessages],
+      sessionOptions: [...this.sessionOptions],
       evaluationTasklistGuid: this.evaluationTasklistGuid ? [['guid', this.evaluationTasklistGuid]] : [],
     });
   }
@@ -1101,16 +1442,177 @@ function summarizeNotification(notification: any): string {
 
 const PAGE_SIZE = 10;
 
+export function searchProjectFiles(cwd: string, query = '', limit = 20): string[] {
+  const root = path.resolve(cwd);
+  const ignored = new Set(['.git', 'node_modules', 'dist', 'dist-web', '.next', 'coverage', '.data']);
+  const needle = query.trim().toLowerCase();
+  const matches: string[] = [];
+  const visit = (dir: string, depth: number) => {
+    if (matches.length >= limit || depth > 8) return;
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (matches.length >= limit) break;
+      if (ignored.has(entry.name)) continue;
+      const absolute = path.join(dir, entry.name);
+      if (entry.isDirectory()) visit(absolute, depth + 1);
+      else if (entry.isFile()) {
+        const relative = path.relative(root, absolute);
+        if (!needle || relative.toLowerCase().includes(needle)) matches.push(relative);
+      }
+    }
+  };
+  visit(root, 0);
+  return matches;
+}
+
+function quoteReference(value: string): string {
+  return /\s/.test(value) ? `"${value.replaceAll('"', '\\"')}"` : value;
+}
+
+function formatReference(reference: PendingReference): string {
+  if (reference.type === 'file') return `@${quoteReference(reference.value)}`;
+  if (reference.type === 'skill') return `$${reference.value}`;
+  return `[$${reference.label ?? reference.value}](app://${reference.value})`;
+}
+
+function referenceCard(title: string, sessionId: string, references: Array<{ type: 'file' | 'skill'; value: string; description?: string }>): Card {
+  if (!references.length) return card(`Codex · ${title}`, [{ tag: 'div', text: { tag: 'lark_md', content: '没有找到匹配项。' } }]);
+  const elements: Array<Record<string, unknown>> = references.map((item) => ({
+    tag: 'div',
+    text: { tag: 'lark_md', content: `**${item.type === 'file' ? '@' : '$'}${item.value}**${item.description ? `\n${item.description.slice(0, 160)}` : ''}` },
+    extra: { tag: 'button', type: 'primary', text: { tag: 'plain_text', content: '选择' }, value: { action: 'reference_select', sessionId, referenceType: item.type, referenceValue: item.value } },
+  }));
+  elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: '可连续选择多个项目；选择完成后直接发送任务内容。' }] });
+  return card(`Codex · ${title}`, elements);
+}
+
+function appCard(sessionId: string, apps: Array<{ id: string; name: string; description?: string | null; installUrl?: string | null; isAccessible: boolean; isEnabled: boolean; installed: boolean; callable: boolean }>): Card {
+  if (!apps.length) return card('Codex · Apps', [{ tag: 'div', text: { tag: 'lark_md', content: '没有找到匹配的 App。' } }]);
+  const elements: Array<Record<string, unknown>> = apps.map((app) => {
+    const status = app.callable ? '可调用' : app.installed ? '已安装但当前不可调用' : app.isAccessible ? '可安装' : '需要授权';
+    const action = app.callable
+      ? { tag: 'button', type: 'primary', text: { tag: 'plain_text', content: '选择' }, value: { action: 'reference_select', sessionId, referenceType: 'app', referenceValue: app.id, referenceLabel: app.name } }
+      : app.installUrl
+        ? { tag: 'button', text: { tag: 'plain_text', content: '安装/授权' }, url: app.installUrl }
+        : undefined;
+    return {
+      tag: 'div',
+      text: { tag: 'lark_md', content: `**$${app.name}** · ${status}${app.description ? `\n${app.description.slice(0, 180)}` : ''}` },
+      ...(action ? { extra: action } : {}),
+    };
+  });
+  elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: 'App 选择后会作为 Connector 引用附加到下一条任务；授权通常需要在浏览器完成。' }] });
+  return card('Codex · Apps', elements);
+}
+
+function modelCard(sessionId: string, models: Array<{ model: string; displayName: string; description?: string; isDefault: boolean }>, selected?: string): Card {
+  const elements: Array<Record<string, unknown>> = models.slice(0, 12).map((model) => ({
+    tag: 'div',
+    text: { tag: 'lark_md', content: `**${model.displayName}**${model.model === selected ? ' · 当前' : model.isDefault ? ' · 默认' : ''}\n${model.model}${model.description ? `\n${model.description.slice(0, 140)}` : ''}` },
+    extra: { tag: 'button', type: model.model === selected ? 'default' : 'primary', text: { tag: 'plain_text', content: model.model === selected ? '已选择' : '选择' }, value: { action: 'model_select', sessionId, model: model.model } },
+  }));
+  return card('Codex · Model', elements.length ? elements : [{ tag: 'div', text: { tag: 'plain_text', content: '没有可用模型。' } }]);
+}
+
+function modeCard(sessionId: string, selected: 'default' | 'plan'): Card {
+  return card('Codex · Mode', [
+    { tag: 'div', text: { tag: 'lark_md', content: `当前模式：**${selected === 'plan' ? 'Plan' : 'Default'}**\n\nPlan 会要求 Codex 先制定计划，不立即修改文件。` } },
+    { tag: 'action', actions: [
+      { tag: 'button', type: selected === 'default' ? 'default' : 'primary', text: { tag: 'plain_text', content: 'Default' }, value: { action: 'mode_select', sessionId, mode: 'default' } },
+      { tag: 'button', type: selected === 'plan' ? 'default' : 'primary', text: { tag: 'plain_text', content: 'Plan' }, value: { action: 'mode_select', sessionId, mode: 'plan' } },
+    ] },
+  ]);
+}
+
+function gitDiffCard(sessionId: string, output: string): Card {
+  return card('Codex · Git Diff', [
+    { tag: 'div', text: { tag: 'lark_md', content: `**Session**\n${sessionId}\n\n\`\`\`diff\n${output.replaceAll('```', '\`\`\`')}\n\`\`\``.slice(0, 13000) } },
+    { tag: 'note', elements: [{ tag: 'plain_text', content: '输出过长时仅显示前 12,000 字符。' }] },
+  ]);
+}
+
+function commitCard(sessionId: string, message: string, status: string): Card {
+  return card('Codex · Commit 确认', [
+    { tag: 'div', text: { tag: 'lark_md', content: `**提交说明**\n${message}\n\n**将提交的变更**\n\`\`\`\n${status.slice(0, 6000)}\n\`\`\`` } },
+    { tag: 'action', actions: [{ tag: 'button', type: 'primary', text: { tag: 'plain_text', content: '确认 Commit' }, value: { action: 'git_commit_confirm', sessionId, message } }] },
+    { tag: 'note', elements: [{ tag: 'plain_text', content: '点击后将执行 git add -A 并创建本地 Commit，不会 Push。' }] },
+  ]);
+}
+
+function contextCard(sessionId: string, references: PendingReference[]): Card {
+  if (!references.length) return card('Codex · Context', [{ tag: 'div', text: { tag: 'lark_md', content: `**Session**\n${sessionId}\n\n当前没有待发送的上下文。` } }]);
+  const elements: Array<Record<string, unknown>> = references.map((item) => ({
+    tag: 'div',
+    text: { tag: 'lark_md', content: `**${formatReference(item)}**` },
+    extra: { tag: 'button', text: { tag: 'plain_text', content: '移除' }, value: { action: 'reference_remove', sessionId, referenceType: item.type, referenceValue: item.value } },
+  }));
+  elements.push({ tag: 'action', actions: [{ tag: 'button', type: 'danger', text: { tag: 'plain_text', content: '全部清空' }, value: { action: 'reference_clear', sessionId } }] });
+  elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: '上下文会附加到下一条任务，发送成功后自动清空；30 分钟未使用将过期。' }] });
+  return card('Codex · Context', elements);
+}
+
+function planCard(sessionId: string, state?: PlanState): Card {
+  const icons = { pending: '⬜', inProgress: '🔄', completed: '✅' } as const;
+  const content = state?.plan.length
+    ? state.plan.map((item) => `${icons[item.status]} ${item.step}`).join('\n')
+    : '当前 Session 暂无计划。发送 `/plan <任务>` 让 Codex 先制定计划。';
+  const title = state?.plan.length ? `Codex · Plan（${state.plan.filter((item) => item.status === 'completed').length}/${state.plan.length}）` : 'Codex · Plan';
+  return card(title, [
+    { tag: 'div', text: { tag: 'lark_md', content: `**Session**\n${sessionId}${state?.explanation ? `\n\n${state.explanation}` : ''}\n\n${content}` } },
+    { tag: 'action', actions: [{ tag: 'button', text: { tag: 'plain_text', content: '刷新计划' }, value: { action: 'plan_refresh', sessionId } }] },
+  ]);
+}
+
+function goalCard(sessionId: string, goal: ThreadGoal | null): Card {
+  if (!goal) return card('Codex · Goal', [{ tag: 'div', text: { tag: 'lark_md', content: `**Session**\n${sessionId}\n\n当前没有 Goal。\n发送 \`/goal create <目标>\` 创建。` } }]);
+  const labels: Record<ThreadGoal['status'], string> = { active: '进行中', paused: '已暂停', blocked: '受阻', usageLimited: '用量受限', budgetLimited: '预算已用尽', complete: '已完成' };
+  const budget = goal.tokenBudget == null ? '不限' : `${goal.tokensUsed}/${goal.tokenBudget} tokens`;
+  const actions: Array<Record<string, unknown>> = [];
+  if (goal.status === 'active') actions.push({ tag: 'button', text: { tag: 'plain_text', content: '暂停' }, value: { action: 'goal_pause', sessionId } });
+  if (goal.status === 'paused' || goal.status === 'blocked') actions.push({ tag: 'button', type: 'primary', text: { tag: 'plain_text', content: '恢复' }, value: { action: 'goal_resume', sessionId } });
+  if (goal.status !== 'complete') actions.push({ tag: 'button', text: { tag: 'plain_text', content: '完成' }, value: { action: 'goal_complete', sessionId } });
+  actions.push({ tag: 'button', type: 'danger', text: { tag: 'plain_text', content: '清除' }, value: { action: 'goal_clear', sessionId } });
+  return card('Codex · Goal', [
+    { tag: 'div', text: { tag: 'lark_md', content: `**Session**\n${sessionId}\n\n**目标**\n${goal.objective}\n\n**状态** ${labels[goal.status]}　**预算** ${budget}\n**运行时间** ${Math.round(goal.timeUsedSeconds / 60)} 分钟` } },
+    { tag: 'action', actions },
+  ]);
+}
+
 function projectCard(projects: Project[], page: number): Card {
   const pages = Math.max(1, Math.ceil(projects.length / PAGE_SIZE));
   const current = Math.min(Math.max(0, page), pages - 1);
-  const elements: Array<Record<string, unknown>> = projects.slice(current * PAGE_SIZE, (current + 1) * PAGE_SIZE).map((project) => ({
-    tag: 'div',
-    text: { tag: 'lark_md', content: `**${project.name}**（${project.sessions.length} 个 Session）\n${project.path}` },
-    extra: { tag: 'button', type: 'primary', text: { tag: 'plain_text', content: '查看 Sessions' }, value: { action: 'project_sessions', projectPath: project.path } },
-  }));
+  const elements: Array<Record<string, unknown>> = projects.slice(current * PAGE_SIZE, (current + 1) * PAGE_SIZE).flatMap((project) => ([
+    {
+      tag: 'div',
+      text: { tag: 'lark_md', content: `**${project.name}**（${project.sessions.length} 个 Session）\n${project.path}` },
+    },
+    {
+      tag: 'action',
+      actions: [
+        { tag: 'button', type: 'primary', text: { tag: 'plain_text', content: '查看 Sessions' }, value: { action: 'project_sessions', projectPath: project.path } },
+        { tag: 'button', text: { tag: 'plain_text', content: '同步' }, value: { action: 'project_sync', projectPath: project.path } },
+      ],
+    },
+    { tag: 'hr' },
+  ]));
   elements.push(navigation('projects_page', current, pages));
   return card(`项目（${current + 1}/${pages}）`, elements);
+}
+
+function projectBindingRecoveryCard(chatId: string, projects: Project[]): Card {
+  const elements: Array<Record<string, unknown>> = [{
+    tag: 'div', text: { tag: 'lark_md', content: '检测到群绑定记录缺失，但历史证据无法唯一确定项目。请选择当前群对应的 Codex Project：' },
+  }];
+  for (const project of projects.slice(0, 20)) {
+    elements.push({
+      tag: 'div',
+      text: { tag: 'lark_md', content: `**${project.name}**（${project.sessions.length} 个 Session）\n${project.path}` },
+      extra: { tag: 'button', type: 'primary', text: { tag: 'plain_text', content: '绑定到此项目' }, value: { action: 'bind_project_confirm', chatId, projectPath: project.path } },
+    });
+  }
+  elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: '绑定只会复用当前群，不会新建重复群。确认后请重新发送刚才的消息。' }] });
+  return card('Codex · 修复群绑定', elements);
 }
 
 function sessionCard(project: Project, page: number): Card {
@@ -1207,6 +1709,31 @@ export function formatDesktopTurn(turn: any): string {
     userText ? `\n你：\n${userText}` : '',
     agentText ? `\nCodex：\n${agentText}` : '',
   ].filter(Boolean).join('\n');
+}
+
+export function formatDesktopTurnMessages(turn: any, maxLength = 3500): string[] {
+  const userItem = (turn?.items ?? []).find((item: any) => item.type === 'userMessage');
+  const agentItem = [...(turn?.items ?? [])].reverse().find((item: any) => item.type === 'agentMessage' && item.text);
+  const userText = extractUserText(userItem);
+  const agentText = String(agentItem?.text ?? '').trim();
+  if (!userText && !agentText) return [];
+  const combined = formatDesktopTurn(turn);
+  if (combined.length <= maxLength) return [combined];
+  const messages: string[] = [];
+  for (const [index, part] of chunkText(userText, maxLength - 80).entries()) {
+    messages.push(`${index === 0 ? '🖥️ 来自 Codex Desktop\n\n你：' : '你（续）：'}\n${part}`);
+  }
+  for (const [index, part] of chunkText(agentText, maxLength - 80).entries()) {
+    messages.push(`${index === 0 ? 'Codex：' : 'Codex（续）：'}\n${part}`);
+  }
+  return messages;
+}
+
+function chunkText(value: string, size: number): string[] {
+  if (!value) return [];
+  const chunks: string[] = [];
+  for (let offset = 0; offset < value.length; offset += size) chunks.push(value.slice(offset, offset + size));
+  return chunks;
 }
 
 function extractUserText(item: any): string {
