@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { FeishuGateway, formatDesktopTurn, formatDesktopTurnMessages, parseDocumentUrl, parseNewCommand, searchProjectFiles } from './feishu.js';
+import { FeishuGateway, extractTurnImagePaths, formatDesktopTurn, formatDesktopTurnMessages, parseDocumentUrl, parseNewCommand, searchProjectFiles } from './feishu.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -48,6 +48,25 @@ describe('searchProjectFiles', () => {
 });
 
 describe('待发送上下文', () => {
+  it('解析粘贴图片形成的富文本消息，并保留命令与本地图片路径', async () => {
+    const writeFile = vi.fn(async (destination: string) => fs.writeFileSync(destination, 'png'));
+    const gateway = new FeishuGateway({} as any) as any;
+    const client = { im: { messageResource: { get: vi.fn(async () => ({ writeFile })) } } };
+    const text = await gateway.parseIncomingMessage(client, {
+      message_id: 'message-1', chat_id: 'chat-1',
+      content: JSON.stringify({ title: '', content: [[
+        { tag: 'text', text: '/new 请检查这个页面' },
+        { tag: 'img', image_key: 'img-key-1' },
+      ]] }),
+    }, 'post');
+
+    expect(text).toContain('/new 请检查这个页面');
+    expect(text).toMatch(/本地路径：.*\.data\/media\/chat-1\/.*\.png/);
+    expect(client.im.messageResource.get).toHaveBeenCalledWith(expect.objectContaining({
+      path: { message_id: 'message-1', file_key: 'img-key-1' }, params: { type: 'image' },
+    }));
+  });
+
   it('生成任务引用时不会提前删除，便于发送失败后重试', () => {
     const gateway = new FeishuGateway({} as any) as any;
     gateway.pendingReferences = new Map([['session-1:user-1', [{ type: 'file', value: 'docs/my file.md', selectedAt: Date.now() }]]]);
@@ -89,6 +108,27 @@ describe('Plan 与 Goal 卡片', () => {
 });
 
 describe('formatDesktopTurn', () => {
+  it('提取回答 Markdown 中存在的本地生成图片', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexreach-output-'));
+    const image = path.join(dir, 'result image.png');
+    fs.writeFileSync(image, 'png');
+    const encoded = image.replace(/ /g, '%20');
+    expect(extractTurnImagePaths({ items: [{ type: 'agentMessage', text: `已生成：![结果](file://${encoded})` }] })).toEqual([image]);
+  });
+
+  it('最终回复未列路径时从本轮 ImageGen 目录找到图片', () => {
+    const oldHome = process.env.HOME;
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codexreach-home-'));
+    process.env.HOME = home;
+    const dir = path.join(home, '.codex', 'generated_images', 'thread-1');
+    fs.mkdirSync(dir, { recursive: true });
+    const image = path.join(dir, 'exec-result.png');
+    fs.writeFileSync(image, 'png');
+    try {
+      expect(extractTurnImagePaths({ items: [{ type: 'agentMessage', text: '图片已生成' }] }, 'thread-1', Date.now() - 1000)).toEqual([image]);
+    } finally { process.env.HOME = oldHome; }
+  });
+
   it('格式化 Desktop 的用户消息与最终回复', () => {
     expect(formatDesktopTurn({ items: [
       { type: 'userMessage', content: [{ type: 'inputText', text: '检查项目' }] },

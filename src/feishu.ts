@@ -587,6 +587,7 @@ export class FeishuGateway {
         } else {
           await client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: target.chatId, msg_type: 'text', content } });
         }
+        if (turn) await this.sendTurnImages(client, target, turn, threadId, this.tasks.get(threadId)?.startedAt);
       } catch (error) { console.error('[feishu-notify]', error); }
       await this.runNext(threadId);
     });
@@ -641,6 +642,7 @@ export class FeishuGateway {
             }});
             if (sent.data?.message_id) messageIds.push(sent.data.message_id);
           }
+          await this.sendTurnImages(this.client, { chatId: topic.chatId, openId: '', rootMessageId: topic.rootMessageId }, turn, thread.id);
           logger.info('desktop_turn_synced', { sessionId: thread.id, turnId: turn.id, messageIds, messageCount: messages.length, rootMessageId: topic.rootMessageId });
           this.markTurnSynced(thread.id, turn.id);
         }
@@ -1185,10 +1187,49 @@ export class FeishuGateway {
     return dir;
   }
 
+  private async sendTurnImages(client: lark.Client, target: Target, turn: any, threadId?: string, startedAt?: number) {
+    for (const imagePath of extractTurnImagePaths(turn, threadId, startedAt)) {
+      try {
+        const uploaded: any = await client.im.v1.image.create({ data: { image_type: 'message', image: fs.createReadStream(imagePath) } });
+        const imageKey = uploaded?.image_key ?? uploaded?.data?.image_key;
+        if (!imageKey) throw new Error('飞书上传图片未返回 image_key');
+        const data = { msg_type: 'image', content: JSON.stringify({ image_key: imageKey }) };
+        if (target.rootMessageId) await client.im.message.reply({ path: { message_id: target.rootMessageId }, data });
+        else await client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: target.chatId, ...data } });
+        logger.info('turn_image_sent', { imagePath, threadRootMessageId: target.rootMessageId });
+      } catch (error) {
+        logger.error('turn_image_send_failed', error, { imagePath });
+      }
+    }
+  }
+
   private async parseIncomingMessage(client: lark.Client, message: any, messageType: string): Promise<string> {
     let content: any = {};
     try { content = JSON.parse(message.content ?? '{}'); } catch { return ''; }
     if (messageType === 'text') return content.text?.trim() ?? '';
+    // 在飞书编辑器里粘贴图片后，消息会由 text/image 变成富文本 post。
+    // post 中的图片仍然需要通过 messageResource 下载，不能只读取文本，否则
+    // 纯图片消息会被当成空消息，而“图片 + /new”也会丢失附件。
+    if (messageType === 'post') {
+      const localeContent = content.zh_cn ?? content.en_us ?? content.ja_jp ?? content;
+      const paragraphs = Array.isArray(localeContent?.content) ? localeContent.content : [];
+      const parts: string[] = [];
+      if (typeof localeContent?.title === 'string' && localeContent.title.trim()) parts.push(localeContent.title.trim());
+      for (const paragraph of paragraphs) {
+        const line: string[] = [];
+        for (const element of Array.isArray(paragraph) ? paragraph : []) {
+          if ((element?.tag === 'text' || element?.tag === 'a') && typeof element.text === 'string') line.push(element.text);
+          if (element?.tag === 'at' && element.user_name) line.push(`@${element.user_name}`);
+          const imageKey = element?.image_key ?? element?.img_key;
+          if ((element?.tag === 'img' || imageKey) && imageKey) {
+            const localPath = await this.downloadMessageResource(client, message, imageKey, 'image');
+            if (localPath) line.push(`\n请处理我粘贴的图片。本地路径：${localPath}\n`);
+          }
+        }
+        if (line.join('').trim()) parts.push(line.join('').trim());
+      }
+      return parts.join('\n').trim();
+    }
     const key = content.file_key ?? content.image_key;
     if (!key || !['file', 'image', 'audio', 'media'].includes(messageType)) return '';
     const safeName = path.basename(content.file_name || `${messageType}-${Date.now()}${messageType === 'image' ? '.png' : ''}`).replace(/[^\p{L}\p{N}._-]+/gu, '_');
@@ -1211,6 +1252,30 @@ export class FeishuGateway {
     } catch (error) {
       logger.error('attachment_download_failed', error, { messageType });
       if (this.client && message.message_id) await this.client.im.message.reply({ path: { message_id: message.message_id }, data: { msg_type: 'text', content: JSON.stringify({ text: `❌ 附件下载失败：${formatFeishuError(error)}` }) } }).catch(() => undefined);
+      return '';
+    }
+  }
+
+  private async downloadMessageResource(client: lark.Client, message: any, key: string, type: 'image' | 'file'): Promise<string> {
+    const safeName = `${type}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${type === 'image' ? '.png' : ''}`;
+    const sessionDir = path.join(this.ensureMediaDir(), String(message.chat_id || 'unknown'));
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const destination = path.join(sessionDir, safeName);
+    try {
+      const api: any = (client.im as any).messageResource;
+      const response = await api.get({ path: { message_id: message.message_id, file_key: key }, params: { type } });
+      const payload = response?.data ?? response;
+      if (Buffer.isBuffer(payload)) fs.writeFileSync(destination, payload);
+      else if (payload?.writeFile) await payload.writeFile(destination);
+      else if (payload?.getReadableStream) {
+        const chunks: Buffer[] = [];
+        for await (const chunk of payload.getReadableStream()) chunks.push(Buffer.from(chunk));
+        fs.writeFileSync(destination, Buffer.concat(chunks));
+      } else throw new Error('飞书未返回可写入的附件内容');
+      logger.info('attachment_downloaded', { messageType: type, destination, richText: true });
+      return destination;
+    } catch (error) {
+      logger.error('attachment_download_failed', error, { messageType: type, richText: true });
       return '';
     }
   }
@@ -1727,6 +1792,34 @@ export function formatDesktopTurnMessages(turn: any, maxLength = 3500): string[]
     messages.push(`${index === 0 ? 'Codex：' : 'Codex（续）：'}\n${part}`);
   }
   return messages;
+}
+
+export function extractTurnImagePaths(turn: any, threadId?: string, startedAt?: number): string[] {
+  const paths = new Set<string>();
+  const agentItems = (turn?.items ?? []).filter((item: any) => item?.type === 'agentMessage');
+  for (const item of agentItems) {
+    const text = String(item?.text ?? '');
+    // Codex 图片结果通常会在最终回复中以绝对路径 Markdown 图片呈现。
+    for (const match of text.matchAll(/!\[[^\]]*\]\(([^)]+)\)/g)) {
+      let candidate = match[1].trim().replace(/^<|>$/g, '');
+      try { candidate = decodeURIComponent(candidate.replace(/^file:\/\//, '')); } catch { /* 保留原路径 */ }
+      if (path.isAbsolute(candidate) && fs.existsSync(candidate) && /\.(png|jpe?g|webp|gif|bmp|ico|tiff?|heic)$/i.test(candidate)) paths.add(candidate);
+    }
+  }
+  // ImageGen 的结果不一定写入最终回复；Codex 会把它保存到线程专属目录。
+  // 飞书发起的回合有 startedAt，因此只回传本轮新生成的文件，避免把历史图重复发送。
+  if (threadId && startedAt) {
+    const generatedDir = path.join(process.env.HOME ?? '', '.codex', 'generated_images', threadId);
+    if (fs.existsSync(generatedDir)) {
+      for (const name of fs.readdirSync(generatedDir)) {
+        const candidate = path.join(generatedDir, name);
+        try {
+          if (/\.(png|jpe?g|webp|gif)$/i.test(name) && fs.statSync(candidate).mtimeMs >= startedAt - 2_000) paths.add(candidate);
+        } catch { /* 文件可能正被清理 */ }
+      }
+    }
+  }
+  return [...paths];
 }
 
 function chunkText(value: string, size: number): string[] {
