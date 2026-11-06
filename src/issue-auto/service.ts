@@ -37,9 +37,27 @@ export class IssueService {
       } catch (e) {
         this.onError(e);
       }
-      for (const taskId of this.store.listActive().slice(0, 1)) {
+      let executionSafe = true;
+      try {
+        this.store.recoverExecution();
+      } catch (error) {
+        executionSafe = false;
+        this.onError(error);
+      }
+      const owner = this.store.executionOwner();
+      const active = this.store.listActive();
+      // An uncertain BLOCKED owner deliberately stops new work until an operator reconciles it.
+      const selected = !executionSafe
+        ? []
+        : owner
+          ? active.includes(owner)
+            ? [owner]
+            : []
+          : active.slice(0, 1);
+      for (const taskId of selected) {
         try {
-          if (this.store.getProgress(taskId)?.stage === 'CI_CHECKING') await this.checkCi(taskId);
+          if (this.store.getProgress(taskId)?.stage === 'CI_CHECKING')
+            await this.checkCi(taskId);
           else await this.coordinator.step(taskId);
         } catch (e) {
           this.onError(e);

@@ -11,6 +11,7 @@ type Store = {
   ): boolean;
 };
 type GitHub = {
+  repositoryUrl?: string;
   pullState?(pr: number): Promise<'open' | 'closed'>;
   checkCi(pr: number, required: string[]): Promise<{ status: string; headSha?: string }>;
 };
@@ -22,6 +23,7 @@ export class PreviewReview {
     private preview: PreviewManager,
     private github: GitHub,
     private sendNotice: (message: string, taskId: string) => Promise<void>,
+    private accepts: (taskId: string) => boolean = () => true,
   ) {}
   private async message(taskId: string, base: string): Promise<string> {
     const before = this.store.getProgress(taskId),
@@ -68,7 +70,7 @@ export class PreviewReview {
     if (this.store.pendingNotices().some((n) => n.taskId === taskId)) return;
     const text = await this.message(
       taskId,
-      `PR #${p.context.prNumber} 的局域网验收预览已就绪：https://github.com/blackpill/usmapgames.com/pull/${p.context.prNumber}`,
+      `PR #${p.context.prNumber} 的局域网验收预览已就绪：${this.github.repositoryUrl ?? 'https://github.com/blackpill/usmapgames.com'}/pull/${p.context.prNumber}`,
     );
     if (this.preview.needsNotice(taskId)) {
       await this.sendNotice(text, taskId);
@@ -80,6 +82,7 @@ export class PreviewReview {
       this.lastClosureCheck === undefined || Date.now() - this.lastClosureCheck >= 300000;
     if (check) this.lastClosureCheck = Date.now();
     for (const r of this.preview.records()) {
+      if (!this.accepts(r.taskId)) continue;
       const p = this.store.getProgress(r.taskId);
       if (
         (p?.stage === 'PAUSED' && p.context.reason === 'pr_closed') ||

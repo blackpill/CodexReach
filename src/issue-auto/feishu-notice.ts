@@ -24,7 +24,9 @@ function allowedLink(raw: string): boolean {
     if (
       u.protocol === 'https:' &&
       u.hostname === 'github.com' &&
-      u.pathname.startsWith('/blackpill/usmapgames.com/')
+      ['/blackpill/usmapgames.com/', '/blackpill/classgames.net/'].some((prefix) =>
+        u.pathname.startsWith(prefix),
+      )
     )
       return true;
     if (u.protocol !== 'http:') return false;

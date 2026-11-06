@@ -166,7 +166,7 @@ EVALUATION_BASE_RESULT_TABLE_ID=<评估结果 table_id>
 
 ## GitHub Issue Auto（试点，默认关闭）
 
-Issue Auto 仅试点 `blackpill/usmapgames.com`，且只接受 `blackpill` 对 `Auto` 标签的可信触发。 每个受管 Session 在对应飞书话题中维护一张进度卡，展示 Codex 活动以及本地验证、PR 和 CI 阶段；单个 Turn 结束不代表 Issue 已完成。进度卡采用节流和串行更新，卡片发送失败不会中断自动任务。GitHub Webhook 由独立 Cloudflare Worker 验签后写入 D1；Mac 通过 HTTPS 领取任务，在本地 SQLite 落库后确认。Issue 的 `Auto` 任务使用独立 worktree，不自动合并、部署或关闭 Issue。
+Issue Auto 默认仍仅启用 `blackpill/usmapgames.com`；代码支持显式声明第二仓 `blackpill/classgames.net`，但其 CI 尚未配置，本次不代表已上线。多仓接入与限制见 [多项目运维](docs/issue-auto-multi-project.md)。两仓共享一个 Runner、SQLite 与开发 Turn 执行槽，且只接受 `blackpill` 对 `Auto` 标签的可信触发。 每个受管 Session 在对应飞书话题中维护一张进度卡，展示 Codex 活动以及本地验证、PR 和 CI 阶段；单个 Turn 结束不代表 Issue 已完成。进度卡采用节流和串行更新，卡片发送失败不会中断自动任务。GitHub Webhook 由独立 Cloudflare Worker 验签后写入 D1；Mac 通过 HTTPS 领取任务，在本地 SQLite 落库后确认。Issue 的 `Auto` 任务使用独立 worktree，不自动合并、部署或关闭 Issue。
 
 **2026-11-05 已在独立测试中验证 Webhook 404 → 自动重投 200，以及 CI 失败 → 读取完整日志 → 自动修复 → CI 通过。** **GitHub 不会自行重投失败的 Webhook。** 配置 `ISSUE_AUTO_WEBHOOK_ID` 后，服务会在运行时约每 5 分钟检查投递记录，按 GUID 去重并有限重投；连续失败、长期无法检查或超过 GitHub 可重投窗口时会发送飞书告警。服务停机期间无法检查，超过 3 天的投递可能无法自动恢复。Mac 本地磁盘丢失后的任务恢复、Runner 突然退出时的子进程清理，以及完整 secret 扫描仍有限制。
 

@@ -20,8 +20,17 @@ export class PreviewStore {
     this.db = new Database(filename);
     this.db.pragma('journal_mode=WAL');
     this.db.exec(
-      'CREATE TABLE IF NOT EXISTS issue_auto_previews(task_id TEXT PRIMARY KEY,pr INTEGER NOT NULL UNIQUE,port INTEGER NOT NULL UNIQUE,data TEXT NOT NULL)',
+      'CREATE TABLE IF NOT EXISTS issue_auto_previews(task_id TEXT PRIMARY KEY,pr INTEGER NOT NULL,port INTEGER NOT NULL UNIQUE,data TEXT NOT NULL)',
     );
+    const schema = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE name='issue_auto_previews'")
+      .get() as { sql: string };
+    if (/pr INTEGER NOT NULL UNIQUE/i.test(schema.sql))
+      this.db.transaction(() => {
+        this.db.exec(
+          'ALTER TABLE issue_auto_previews RENAME TO issue_auto_previews_legacy; CREATE TABLE issue_auto_previews(task_id TEXT PRIMARY KEY,pr INTEGER NOT NULL,port INTEGER NOT NULL UNIQUE,data TEXT NOT NULL); INSERT INTO issue_auto_previews SELECT * FROM issue_auto_previews_legacy; DROP TABLE issue_auto_previews_legacy;',
+        );
+      })();
   }
   get(taskId: string): PreviewRecord | undefined {
     const row = this.db

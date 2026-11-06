@@ -1,5 +1,14 @@
 import { describe, it, expect, vi } from 'vitest';
 import { GitHubClient } from './github.js';
+// Existing endpoint tests still exercise their exact fetch/log/redirect boundaries; repository
+// identity checks are covered separately with wrong-ID and changed-name regressions.
+function github(token: string, fetcher: typeof fetch) {
+  return new GitHubClient(token, async (url, init) =>
+    String(url) === 'https://api.github.com/repos/blackpill/usmapgames.com'
+      ? Response.json({ id: 1444221313, full_name: 'blackpill/usmapgames.com' })
+      : fetcher(url, init),
+  );
+}
 function fake(routes: Record<string, unknown[]>) {
   return vi.fn(async (url: any) => {
     const key = new URL(String(url)).pathname + new URL(String(url)).search;
@@ -25,13 +34,16 @@ describe('PR CI safety', () => {
       ],
       [statuses]: [[]],
     });
-    const client = new GitHubClient('test', fetcher);
-    expect(await client.checkCi(7, ['verify'])).toMatchObject({ status: 'passed', headSha: SHA });
+    const client = github('test', fetcher);
+    expect(await client.checkCi(7, ['verify'])).toMatchObject({
+      status: 'passed',
+      headSha: SHA,
+    });
     expect(await client.checkCi(7, [])).toMatchObject({ status: 'blocked' });
   });
   it('rejects stale head and never treats missing, skipped or ambiguous checks as success', async () => {
     const make = (runs: unknown[], second = SHA) =>
-      new GitHubClient(
+      github(
         'test',
         fake({
           [pull]: [
@@ -49,8 +61,11 @@ describe('PR CI safety', () => {
       (await make([{ ...success, conclusion: 'skipped' }]).checkCi(7, ['verify'])).status,
     ).toBe('blocked');
     expect(
-      (await make([success, { ...success, id: 2, conclusion: 'failure' }]).checkCi(7, ['verify']))
-        .status,
+      (
+        await make([success, { ...success, id: 2, conclusion: 'failure' }]).checkCi(7, [
+          'verify',
+        ])
+      ).status,
     ).toBe('blocked');
   });
 });
@@ -74,19 +89,29 @@ it('recovers a PR created before a lost create response without creating a dupli
           ],
     );
   };
-  const client = new GitHubClient('token', fetcher);
+  const client = github('token', fetcher);
   expect(
-    await client.ensurePr({ branch: 'codex/issue-1-abc', title: 'Issue #1', body: 'Issue #1' }),
+    await client.ensurePr({
+      branch: 'codex/issue-1-abc',
+      title: 'Issue #1',
+      body: 'Issue #1',
+    }),
   ).toMatchObject({ number: 9 });
   expect(calls.filter((x) => x.method === 'POST')).toHaveLength(1);
 });
 it('returns issue data only for an open Auto issue', async () => {
   const issue = '/repos/blackpill/usmapgames.com/issues/12';
-  const client = new GitHubClient(
+  const client = github(
     'token',
     fake({
       [issue]: [
-        { number: 12, state: 'open', title: 'Title', body: 'Details', labels: [{ name: 'Auto' }] },
+        {
+          number: 12,
+          state: 'open',
+          title: 'Title',
+          body: 'Details',
+          labels: [{ name: 'Auto' }],
+        },
       ],
     }),
   );
@@ -111,7 +136,7 @@ it('includes bounded check output as evidence for a failed CI check', async () =
     ],
     [statuses]: [[]],
   });
-  const result = await new GitHubClient('token', fetcher).checkCi(7, ['verify']);
+  const result = await github('token', fetcher).checkCi(7, ['verify']);
   expect(result.status).toBe('failed');
   expect(result.reason).toContain('test failure details');
 });
@@ -126,7 +151,7 @@ it('downloads full job logs without forwarding credentials to the signed URL', a
       });
     return new Response('complete line one\ncomplete line two');
   };
-  const client = new GitHubClient('secret-token', fetcher);
+  const client = github('secret-token', fetcher);
   expect(await client.downloadJobLogs(42)).toBe('complete line one\ncomplete line two');
   expect(JSON.stringify(seen[1].headers ?? {})).not.toContain('secret-token');
 });
@@ -136,7 +161,7 @@ it('rejects redirects to untrusted domains before requesting them', async () => 
     .mockResolvedValue(
       new Response(null, { status: 302, headers: { location: 'https://attacker.invalid/a' } }),
     );
-  await expect(new GitHubClient('secret', fetcher as any).downloadJobLogs(42)).rejects.toThrow();
+  await expect(github('secret', fetcher as any).downloadJobLogs(42)).rejects.toThrow();
   expect(fetcher).toHaveBeenCalledTimes(1);
 });
 it('binds failed logs only to a GitHub Actions job in the expected repository', async () => {
@@ -158,7 +183,7 @@ it('binds failed logs only to a GitHub Actions job in the expected repository', 
     ],
     [statuses]: [[]],
   });
-  expect(await new GitHubClient('token', fetcher).checkCi(7, ['verify'])).toMatchObject({
+  expect(await github('token', fetcher).checkCi(7, ['verify'])).toMatchObject({
     status: 'failed',
     jobId: 42,
   });
@@ -176,14 +201,14 @@ it('paginates webhook deliveries using GitHub cursor links and rejects foreign n
         headers: { link: '<https://attacker.invalid/x?cursor=abc>; rel="next"' },
       }),
     );
-  const client = new GitHubClient('token', fetcher as any);
+  const client = github('token', fetcher as any);
   expect(await client.listWebhookDeliveries(10)).toEqual({ items: [], nextCursor: 'abc' });
   await expect(client.listWebhookDeliveries(10, 'abc')).rejects.toThrow('untrusted');
   expect(String(fetcher.mock.calls[1][0])).toContain('cursor=abc');
 });
 it('requests webhook redelivery through the repository-scoped GitHub endpoint', async () => {
   const fetcher = vi.fn().mockResolvedValue(new Response(null, { status: 202 }));
-  await new GitHubClient('token', fetcher as any).redeliverWebhook(10, '55');
+  await github('token', fetcher as any).redeliverWebhook(10, '55');
   expect(String(fetcher.mock.calls[0][0])).toBe(
     'https://api.github.com/repos/blackpill/usmapgames.com/hooks/10/deliveries/55/attempts',
   );
@@ -199,19 +224,19 @@ it('preserves 64-bit webhook delivery identifiers without JavaScript precision l
       ),
     )
     .mockResolvedValueOnce(new Response(null, { status: 202 }));
-  const client = new GitHubClient('token', fetcher as any);
+  const client = github('token', fetcher as any);
   const page = await client.listWebhookDeliveries(10);
   expect(page.items[0].id).toBe(id);
   await client.redeliverWebhook(10, id);
   expect(String(fetcher.mock.calls[1][0])).toContain(`/deliveries/${id}/attempts`);
 });
 it('reads PR closure without depending on checks', async () => {
-  const client = new GitHubClient('token', fake({ [pull]: [{ state: 'closed' }] }));
+  const client = github('token', fake({ [pull]: [{ state: 'closed' }] }));
   expect(await client.pullState(7)).toBe('closed');
 });
 it('never acts on failed or skipped checks after the PR head changes', async () => {
   for (const conclusion of ['failure', 'skipped']) {
-    const client = new GitHubClient(
+    const client = github(
       'token',
       fake({
         [pull]: [

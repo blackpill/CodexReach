@@ -1,18 +1,49 @@
+import { projectUrl } from './config.js';
 export type CiResult = {
   status: 'passed' | 'pending' | 'failed' | 'blocked';
   headSha?: string;
   reason?: string;
   jobId?: number;
 };
-const REPO = '/repos/blackpill/usmapgames.com';
 export class GitHubClient {
+  private REPO: string;
+  private webUrl: string;
   constructor(
     private token: string,
     private fetcher: typeof fetch = fetch,
+    private project: {
+      repositoryId: number;
+      owner: string;
+      repo: string;
+      baseBranch: string;
+    } = {
+      repositoryId: 1444221313,
+      owner: 'blackpill',
+      repo: 'usmapgames.com',
+      baseBranch: 'main',
+    },
   ) {
     if (!token) throw new Error('GitHub token required');
+    this.webUrl = projectUrl(project);
+    if (project.baseBranch !== 'main') throw Error('untrusted base branch');
+    this.REPO = `/repos/${project.owner}/${project.repo}`;
+  }
+  get repositoryUrl(): string {
+    return this.webUrl;
+  }
+  private async assertRepositoryIdentity(): Promise<void> {
+    const repository = await this.request(this.REPO);
+    if (
+      repository?.id !== this.project.repositoryId ||
+      repository?.full_name !== `${this.project.owner}/${this.project.repo}`
+    )
+      throw Error('GitHub repository identity mismatch');
   }
   private async get(path: string): Promise<any> {
+    await this.assertRepositoryIdentity();
+    return this.request(path);
+  }
+  private async request(path: string): Promise<any> {
     const result = await this.fetcher(`https://api.github.com${path}`, {
       headers: {
         authorization: `Bearer ${this.token}`,
@@ -35,7 +66,8 @@ export class GitHubClient {
       (cursor !== undefined && (cursor.length > 500 || !cursor))
     )
       throw new Error('invalid webhook pagination');
-    const endpoint = `${REPO}/hooks/${hookId}/deliveries`;
+    await this.assertRepositoryIdentity();
+    const endpoint = `${this.REPO}/hooks/${hookId}/deliveries`;
     const query = new URLSearchParams({ per_page: '100' });
     if (cursor) query.set('cursor', cursor);
     const response = await this.fetcher(`https://api.github.com${endpoint}?${query}`, {
@@ -72,8 +104,9 @@ export class GitHubClient {
       /^0+$/.test(deliveryId)
     )
       throw new Error('invalid webhook delivery id');
+    await this.assertRepositoryIdentity();
     const response = await this.fetcher(
-      `https://api.github.com${REPO}/hooks/${hookId}/deliveries/${deliveryId}/attempts`,
+      `https://api.github.com${this.REPO}/hooks/${hookId}/deliveries/${deliveryId}/attempts`,
       {
         method: 'POST',
         headers: {
@@ -85,12 +118,14 @@ export class GitHubClient {
         signal: AbortSignal.timeout(15000),
       },
     );
-    if (response.status !== 202) throw new Error(`GitHub redelivery failed: ${response.status}`);
+    if (response.status !== 202)
+      throw new Error(`GitHub redelivery failed: ${response.status}`);
   }
   async downloadJobLogs(jobId: number): Promise<string> {
     if (!Number.isSafeInteger(jobId) || jobId < 1) throw new Error('invalid job id');
+    await this.assertRepositoryIdentity();
     const response = await this.fetcher(
-      `https://api.github.com${REPO}/actions/jobs/${jobId}/logs`,
+      `https://api.github.com${this.REPO}/actions/jobs/${jobId}/logs`,
       {
         headers: {
           authorization: `Bearer ${this.token}`,
@@ -101,7 +136,8 @@ export class GitHubClient {
         signal: AbortSignal.timeout(15000),
       },
     );
-    if (response.status !== 302) throw new Error(`GitHub job log unavailable: ${response.status}`);
+    if (response.status !== 302)
+      throw new Error(`GitHub job log unavailable: ${response.status}`);
     const location = response.headers.get('location');
     if (!location) throw new Error('job log redirect missing');
     const url = new URL(location);
@@ -111,7 +147,10 @@ export class GitHubClient {
       url.username ||
       url.password ||
       url.port ||
-      !(host.endsWith('.actions.githubusercontent.com') || host.endsWith('.blob.core.windows.net'))
+      !(
+        host.endsWith('.actions.githubusercontent.com') ||
+        host.endsWith('.blob.core.windows.net')
+      )
     )
       throw new Error('untrusted job log redirect');
     const download = await this.fetcher(url.toString(), {
@@ -155,16 +194,16 @@ export class GitHubClient {
       throw new Error('invalid branch');
     const find = async () => {
       const list = await this.get(
-        `${REPO}/pulls?state=open&head=${encodeURIComponent(`blackpill:${input.branch}`)}&base=main&per_page=100`,
+        `${this.REPO}/pulls?state=open&head=${encodeURIComponent(`${this.project.owner}:${input.branch}`)}&base=${this.project.baseBranch}&per_page=100`,
       );
       if (!Array.isArray(list) || list.length > 1) throw new Error('ambiguous pull requests');
       if (!list.length) return undefined;
       const pr = list[0];
       if (
         pr?.head?.ref !== input.branch ||
-        pr?.base?.ref !== 'main' ||
+        pr?.base?.ref !== this.project.baseBranch ||
         !Number.isSafeInteger(pr.number) ||
-        pr.html_url !== `https://github.com/blackpill/usmapgames.com/pull/${pr.number}`
+        pr.html_url !== `${this.webUrl}/pull/${pr.number}`
       )
         throw new Error('unexpected pull request');
       return { number: pr.number as number, url: pr.html_url as string };
@@ -172,7 +211,8 @@ export class GitHubClient {
     const existing = await find();
     if (existing) return existing;
     try {
-      const response = await this.fetcher(`https://api.github.com${REPO}/pulls`, {
+      await this.assertRepositoryIdentity();
+      const response = await this.fetcher(`https://api.github.com${this.REPO}/pulls`, {
         method: 'POST',
         headers: {
           authorization: `Bearer ${this.token}`,
@@ -184,7 +224,7 @@ export class GitHubClient {
           title: input.title,
           body: input.body,
           head: input.branch,
-          base: 'main',
+          base: this.project.baseBranch,
         }),
         redirect: 'error',
         signal: AbortSignal.timeout(15000),
@@ -193,7 +233,7 @@ export class GitHubClient {
       const pr: any = await response.json();
       if (
         !Number.isSafeInteger(pr.number) ||
-        pr.html_url !== `https://github.com/blackpill/usmapgames.com/pull/${pr.number}`
+        pr.html_url !== `${this.webUrl}/pull/${pr.number}`
       )
         throw new Error('invalid PR response');
       return { number: pr.number, url: pr.html_url };
@@ -205,14 +245,14 @@ export class GitHubClient {
   }
   async pullState(pr: number): Promise<'open' | 'closed'> {
     if (!Number.isSafeInteger(pr) || pr < 1) throw Error('invalid PR');
-    const data = await this.get(`${REPO}/pulls/${pr}`);
+    const data = await this.get(`${this.REPO}/pulls/${pr}`);
     if (data.state !== 'open' && data.state !== 'closed') throw Error('invalid PR state');
     return data.state;
   }
   async issueDetails(issueNumber: number): Promise<{ title: string; body: string }> {
     if (!Number.isSafeInteger(issueNumber) || issueNumber < 1)
       throw new Error('invalid issue number');
-    const issue = await this.get(`${REPO}/issues/${issueNumber}`);
+    const issue = await this.get(`${this.REPO}/issues/${issueNumber}`);
     if (
       issue.number !== issueNumber ||
       issue.state !== 'open' ||
@@ -225,14 +265,14 @@ export class GitHubClient {
     return { title: issue.title.slice(0, 500), body: (issue.body ?? '').slice(0, 50000) };
   }
   async defaultBranchSha(): Promise<string> {
-    const branch = await this.get(`${REPO}/branches/main`);
+    const branch = await this.get(`${this.REPO}/branches/${this.project.baseBranch}`);
     if (!/^[0-9a-f]{40}$/.test(branch?.commit?.sha ?? ''))
       throw new Error('invalid default branch SHA');
     return branch.commit.sha;
   }
   async issueEligible(issueNumber: number): Promise<boolean> {
     if (!Number.isSafeInteger(issueNumber) || issueNumber < 1) return false;
-    const issue = await this.get(`${REPO}/issues/${issueNumber}`);
+    const issue = await this.get(`${this.REPO}/issues/${issueNumber}`);
     return (
       issue.state === 'open' &&
       Array.isArray(issue.labels) &&
@@ -248,20 +288,22 @@ export class GitHubClient {
       new Set(required).size !== required.length
     )
       return { status: 'blocked', reason: 'invalid_required_checks' };
-    const pull = await this.get(`${REPO}/pulls/${prNumber}`);
+    const pull = await this.get(`${this.REPO}/pulls/${prNumber}`);
     const sha = pull?.head?.sha;
     if (pull.state === 'closed') return { status: 'blocked', reason: 'pr_closed' };
     if (pull.state !== 'open' || typeof sha !== 'string' || !/^[0-9a-f]{40}$/.test(sha))
       return { status: 'blocked', reason: 'invalid_pull_request' };
     const finish = async (outcome: CiResult): Promise<CiResult> => {
-      const latest = await this.get(`${REPO}/pulls/${prNumber}`);
+      const latest = await this.get(`${this.REPO}/pulls/${prNumber}`);
       if (latest?.state !== 'open' || latest?.head?.sha !== sha)
         return { status: 'pending', reason: 'head_changed' };
       return outcome;
     };
     const runs: any[] = [];
     for (let page = 1; page <= 10; page++) {
-      const data = await this.get(`${REPO}/commits/${sha}/check-runs?per_page=100&page=${page}`);
+      const data = await this.get(
+        `${this.REPO}/commits/${sha}/check-runs?per_page=100&page=${page}`,
+      );
       if (!Array.isArray(data.check_runs) || !Number.isSafeInteger(data.total_count))
         return finish({ status: 'blocked', reason: 'invalid_checks' });
       runs.push(...data.check_runs);
@@ -271,11 +313,15 @@ export class GitHubClient {
     }
     const statuses: any[] = [];
     for (let page = 1; page <= 10; page++) {
-      const data = await this.get(`${REPO}/commits/${sha}/statuses?per_page=100&page=${page}`);
-      if (!Array.isArray(data)) return finish({ status: 'blocked', reason: 'invalid_statuses' });
+      const data = await this.get(
+        `${this.REPO}/commits/${sha}/statuses?per_page=100&page=${page}`,
+      );
+      if (!Array.isArray(data))
+        return finish({ status: 'blocked', reason: 'invalid_statuses' });
       statuses.push(...data);
       if (data.length < 100) break;
-      if (page === 10) return finish({ status: 'blocked', reason: 'status_pagination_incomplete' });
+      if (page === 10)
+        return finish({ status: 'blocked', reason: 'status_pagination_incomplete' });
     }
     let outcome: CiResult = { status: 'passed', headSha: sha };
     for (const name of required) {
@@ -294,12 +340,20 @@ export class GitHubClient {
       if (matches[0] === 'failure' || matches[0] === 'error') {
         const check = runs.find((x) => x.name === name);
         const summary =
-          typeof check?.output?.summary === 'string' ? check.output.summary.slice(0, 3000) : '';
+          typeof check?.output?.summary === 'string'
+            ? check.output.summary.slice(0, 3000)
+            : '';
         const detail =
           typeof check?.details_url === 'string'
-            ? /^https:\/\/github\.com\/blackpill\/usmapgames\.com\/actions\/runs\/\d+\/job\/(\d+)(?:[?#].*)?$/.exec(
-                check.details_url,
-              )
+            ? (() => {
+                const url = new URL(check.details_url);
+                if (url.origin !== 'https://github.com' || url.username || url.password)
+                  return null;
+                const prefix = `/${this.project.owner}/${this.project.repo}/actions/runs/`;
+                return url.pathname.startsWith(prefix)
+                  ? /^\d+\/job\/(\d+)$/.exec(url.pathname.slice(prefix.length))
+                  : null;
+              })()
             : null;
         const jobId = detail ? Number(detail[1]) : undefined;
         return finish({

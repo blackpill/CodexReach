@@ -18,23 +18,39 @@ async function run(
       cwd,
       timeout,
       maxBuffer: 1024 * 1024,
-      env: { ...process.env, ...extraEnv, GIT_TERMINAL_PROMPT: '0', CI: 'true', DO_NOT_TRACK: '1' },
+      env: {
+        ...process.env,
+        ...extraEnv,
+        GIT_TERMINAL_PROMPT: '0',
+        CI: 'true',
+        DO_NOT_TRACK: '1',
+      },
     })
   ).stdout.trim();
 }
-export async function fetchBase(project: string, sha: string, remote: string): Promise<void> {
-  if (!/^[0-9a-f]{40}$/.test(sha) || !remote) throw new Error('invalid base');
+export async function fetchBase(
+  project: string,
+  sha: string,
+  remote: string,
+  baseBranch = 'main',
+): Promise<void> {
+  if (!/^[0-9a-f]{40}$/.test(sha) || !remote || baseBranch !== 'main')
+    throw new Error('invalid base');
   if (
     (await run(project, 'git', ['remote', 'get-url', 'origin'])) !== remote ||
     (await run(project, 'git', ['remote', 'get-url', '--push', 'origin'])) !== remote
   )
     throw new Error('unexpected remote');
-  await run(project, 'git', ['fetch', '--no-tags', 'origin', 'main']);
+  await run(project, 'git', ['fetch', '--no-tags', 'origin', baseBranch]);
   if ((await run(project, 'git', ['rev-parse', 'FETCH_HEAD'])) !== sha)
     throw new Error('remote branch changed during fetch');
 }
-const install = async (cwd: string, nodeBin: string) => {
-  await run(cwd, 'npm', ['ci', '--no-audit', '--no-fund'], 15 * 60_000, {
+const install = async (
+  cwd: string,
+  nodeBin: string,
+  command: ValidationCommand = { executable: 'npm', args: ['ci', '--no-audit', '--no-fund'] },
+) => {
+  await run(cwd, command.executable, command.args, 15 * 60_000, {
     PATH: `${path.dirname(nodeBin)}:${process.env.PATH ?? ''}`,
   });
 };
@@ -50,6 +66,7 @@ export const runtimeIO = {
     nodeBin: string;
     env?: NodeJS.ProcessEnv;
     commands: ValidationCommand[];
-  }) => validateIsolated(input, (cwd) => install(cwd, input.nodeBin)),
+    install?: ValidationCommand;
+  }) => validateIsolated(input, (cwd) => install(cwd, input.nodeBin, input.install)),
   push: pushValidated,
 };
