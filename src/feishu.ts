@@ -1,4 +1,6 @@
 import * as lark from '@larksuiteoapi/node-sdk';
+import type {TopicReceipt} from './issue-auto/dual-notice.js';
+import {preciseTopicLink,directNoticeContent} from './issue-auto/feishu-notice.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -17,7 +19,7 @@ type ProjectGroup = { projectPath: string; projectName: string; chatId: string; 
 type SessionTopic = { sessionId: string; chatId: string; threadId: string; rootMessageId: string };
 type Target = { chatId: string; openId: string; rootMessageId?: string };
 type QueuedMessage = { text: string; target: Target; at: number };
-type TaskState = { startedAt: number; lastActivityAt: number; turnId?: string; cardMessageId?: string; status: 'queued' | 'running' | 'completed' | 'failed' | 'stopped' | 'timeout'; detail?: string; lastPrompt?: string };
+type TaskState = { startedAt: number; lastActivityAt: number; turnId?: string; cardMessageId?: string; status: 'queued' | 'running' | 'completed' | 'failed' | 'stopped' | 'timeout'; detail?: string; lastPrompt?: string; managedIssue?: boolean; issueStage?: string };
 type PlanState = { explanation?: string | null; plan: Array<{ step: string; status: 'pending' | 'inProgress' | 'completed' }> };
 type PendingReference = { type: 'file' | 'skill' | 'app'; value: string; label?: string; selectedAt: number };
 type DocumentBinding = { fileToken: string; fileType: 'doc' | 'docx'; url: string; projectPath: string; projectName: string };
@@ -59,6 +61,11 @@ export class FeishuGateway {
   private projectsCache?: { at: number; projects: Project[] };
   private queues = new Map<string, QueuedMessage[]>();
   private tasks = new Map<string, TaskState>();
+  private issueTaskCardIds = new Map<string, string>();
+  private issueTaskCardTimers = new Map<string, NodeJS.Timeout>();
+  private issueTaskCardCreates = new Map<string, Promise<void>>();
+  private issueTaskCardDirty = new Set<string>();
+  private issueTaskCardUpdating = new Set<string>();
   private plans = new Map<string, PlanState>();
   private goals = new Map<string, ThreadGoal>();
   private planCardMessages = new Map<string, string>();
@@ -92,6 +99,119 @@ export class FeishuGateway {
 
   setEvaluationDueHandler(handler: EvaluationDueHandler) {
     this.evaluationDueHandler = handler;
+  }
+
+  hasProjectGroup(projectPath: string): boolean { return !!this.client && this.projectGroups.has(projectPath); }
+  async recordIssueTurn(sessionId: string, turnId: string): Promise<void> {
+    try { this.recordBridgeTurn(sessionId, turnId); } catch (error) { logger.error('issue_turn_correlation_failed', error, { sessionId }); }
+    const prior = this.tasks.get(sessionId);
+    this.tasks.set(sessionId, { startedAt: prior?.managedIssue ? prior.startedAt : Date.now(), lastActivityAt: Date.now(), turnId, status: 'running', detail: 'Issue 自动任务正在执行 Codex 回合。', managedIssue: true, issueStage: 'DEVELOPING', cardMessageId: this.issueTaskCardIds.get(sessionId) });
+    try { await this.ensureIssueProgressCard(sessionId); } catch (error) { logger.error('issue_progress_card_failed', error, { sessionId }); }
+  }
+
+  async updateIssueStage(sessionId: string, stage: string): Promise<void> {
+    if (!this.targets.has(sessionId)) return;
+    const labels: Record<string, string> = {
+      PREPARING: '正在准备工作区。', DEVELOPING: '正在分析或修改代码。',
+      VALIDATING: '正在运行独立本地验证。', CREATING_PR: '本地验证通过，正在准备 PR。',
+      CI_CHECKING: 'PR 已创建，正在等待 GitHub CI。', PR_READY: '正在复核 CI，审核提醒将单独发送。', PR_NOTIFIED: 'CI 已通过，PR 等待人工审核。',
+      BLOCKED: '任务需要人工处理，请查看话题中的提醒。', WAITING_QUOTA: '额度不足，等待处理。', PAUSED: '任务已暂停。',
+    };
+    const prior = this.tasks.get(sessionId);
+    const status: TaskState['status'] = stage === 'PR_NOTIFIED' ? 'completed' : stage === 'BLOCKED' || stage === 'WAITING_QUOTA' ? 'failed' : stage === 'PAUSED' ? 'stopped' : 'running';
+    this.tasks.set(sessionId, { startedAt: prior?.managedIssue ? prior.startedAt : Date.now(), lastActivityAt: Date.now(), turnId: prior?.turnId, managedIssue: true, issueStage: stage, status, detail: labels[stage] ?? `Issue 任务阶段：${stage}`, cardMessageId: this.issueTaskCardIds.get(sessionId) });
+    try { await this.ensureIssueProgressCard(sessionId); } catch (error) { logger.error('issue_progress_card_failed', error, { sessionId }); }
+  }
+
+  private async ensureIssueProgressCard(sessionId: string): Promise<void> {
+    const target = this.targets.get(sessionId);
+    if (!target || !this.client) return;
+    if (this.issueTaskCardIds.has(sessionId)) { this.scheduleIssueTaskCardUpdate(sessionId); return; }
+    const pending = this.issueTaskCardCreates.get(sessionId);
+    if (pending) return pending;
+    const creating = (async () => {
+      await this.sendTaskCard(sessionId, target, 'running');
+      const messageId = this.tasks.get(sessionId)?.cardMessageId;
+      if (messageId) { this.issueTaskCardIds.set(sessionId, messageId); this.saveState(); this.scheduleIssueTaskCardUpdate(sessionId); }
+    })();
+    this.issueTaskCardCreates.set(sessionId, creating);
+    try { await creating; } finally { this.issueTaskCardCreates.delete(sessionId); }
+  }
+
+  private async handleTaskStatusNotification(threadId: string, notification: any): Promise<void> {
+    const state = this.tasks.get(threadId);
+    if (!state || (state.managedIssue && state.issueStage && state.issueStage !== 'DEVELOPING')) return;
+    state.lastActivityAt = Date.now();
+    state.turnId = notification.params?.turn?.id ?? state.turnId;
+    state.detail = summarizeNotification(notification);
+    if (notification.method === 'turn/completed') {
+      const turnStatus = notification.params?.turn?.status;
+      state.status = turnStatus === 'failed' ? 'failed' : turnStatus === 'interrupted' ? 'stopped' : state.managedIssue ? 'running' : 'completed';
+      if (state.managedIssue && turnStatus === 'completed') state.detail = '本轮 Codex 已结束，Supervisor 将继续验证及处理 CI。';
+    }
+    if (state.managedIssue) this.scheduleIssueTaskCardUpdate(threadId);
+    else await this.updateTaskCard(threadId).catch(error => logger.error('card_update_failed', error, { threadId }));
+  }
+
+  private scheduleIssueTaskCardUpdate(sessionId: string) {
+    this.issueTaskCardDirty.add(sessionId);
+    if (this.issueTaskCardTimers.has(sessionId) || this.issueTaskCardUpdating.has(sessionId)) return;
+    this.issueTaskCardTimers.set(sessionId, setTimeout(() => {
+      this.issueTaskCardTimers.delete(sessionId);
+      this.issueTaskCardDirty.delete(sessionId);
+      this.issueTaskCardUpdating.add(sessionId);
+      void this.updateTaskCard(sessionId).catch(error => logger.error('issue_progress_update_failed', error, { sessionId })).finally(() => {
+        this.issueTaskCardUpdating.delete(sessionId);
+        if (this.issueTaskCardDirty.has(sessionId)) this.scheduleIssueTaskCardUpdate(sessionId);
+      });
+    }, 2000));
+  }
+
+  async bindIssueSession(projectPath: string, sessionId: string, title: string): Promise<string> {
+    if (!this.client) throw new Error('飞书客户端尚未初始化');
+    const group = this.projectGroups.get(projectPath);
+    if (!group) throw new Error('找不到 Issue 任务对应的项目群');
+    const topic = await this.ensureSessionTopic(this.client, group, sessionId, title);
+    this.targets.set(sessionId, { chatId: group.chatId, openId: '', rootMessageId: topic.rootMessageId });
+    this.saveState();
+    return topic.threadId;
+  }
+
+  async sendIssueTopicRecord(input:{projectPath:string;message:string;sessionId?:string;uuid:string}):Promise<TopicReceipt> {
+    if(!this.client)throw Error('飞书客户端尚未初始化');const group=this.projectGroups.get(input.projectPath);if(!group)throw Error('找不到 Issue 任务对应的项目群');
+    const topic=input.sessionId?this.sessionTopics.get(input.sessionId):undefined;
+    if(input.sessionId&&(!topic||topic.chatId!==group.chatId))throw Error('找不到 Issue 任务对应的话题');
+    const content=JSON.stringify({text:input.message.slice(0,3900)});
+    const result=topic?await this.client.im.message.reply({path:{message_id:topic.rootMessageId},data:{msg_type:'text',content,uuid:input.uuid}}):await this.client.im.message.create({params:{receive_id_type:'chat_id'},data:{receive_id:group.chatId,msg_type:'text',content,uuid:input.uuid}});
+    const m=result.data as any;if(result.code||!m?.message_id)throw Error(`发送 Topic 记录失败：${result.msg??result.code??'unknown'}`);
+    return {messageId:m.message_id,chatId:m.chat_id??group.chatId,threadId:m.thread_id??topic?.threadId,position:m.thread_message_position,appLink:m.message_app_link};
+  }
+
+  async resolveIssueTopicLink(receipt:TopicReceipt):Promise<string> {
+    try{return preciseTopicLink(receipt);}catch{
+      if(!this.client)throw Error('飞书客户端尚未初始化');
+      const r=await this.client.im.message.get({path:{message_id:receipt.messageId}});const m=r.data?.items?.find(x=>x.message_id===receipt.messageId) as any;
+      if(r.code||!m||m.deleted||m.chat_id!==receipt.chatId)throw Error('无法定位本条 Topic 消息');
+      return preciseTopicLink({...receipt,threadId:m.thread_id,position:m.thread_message_position,appLink:m.message_app_link});
+    }
+  }
+
+  async sendIssueDirectNotice(input:{recipient:string;message:string;link:string;uuid:string}):Promise<string> {
+    if(!this.client)throw Error('飞书客户端尚未初始化');if(!/^ou_[A-Za-z0-9]+$/.test(input.recipient))throw Error('无效的单聊接收人');
+    const r=await this.client.im.message.create({params:{receive_id_type:'open_id'},data:{receive_id:input.recipient,msg_type:'post',content:JSON.stringify(directNoticeContent(input.message,input.link)),uuid:input.uuid}});
+    if(r.code||!r.data?.message_id)throw Error(`单聊提醒发送失败：${r.msg??r.code??'unknown'}`);return r.data.message_id;
+  }
+
+  async sendIssueAutoNotice(projectPath: string, message: string, sessionId?: string): Promise<void> {
+    if (!this.client) throw new Error('飞书客户端尚未初始化');
+    const group = this.projectGroups.get(projectPath);
+    if (!group) throw new Error('找不到 Issue 任务对应的项目群');
+    const topic = sessionId ? this.sessionTopics.get(sessionId) : undefined;
+    const content = JSON.stringify({ text: message.slice(0, 3900) });
+    const result = topic && topic.chatId === group.chatId
+      ? await this.client.im.message.reply({ path: { message_id: topic.rootMessageId }, data: { msg_type: 'text', content } })
+      : await this.client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: group.chatId, msg_type: 'text', content } });
+    if (result.code) throw new Error(`发送 Issue 任务通知失败：${result.msg}`);
   }
 
   async sendEvaluationDraft(projectPath: string, sourceSessionId: string, draft: EvaluationDraft): Promise<boolean> {
@@ -409,6 +529,9 @@ export class FeishuGateway {
         const openId = event.operator?.open_id ?? event.open_id ?? '';
         if (allowed.size && !allowed.has(openId)) return;
         const value = event.action?.value ?? {};
+        if (value.sessionId && ['task_retry','model_select','mode_select','git_commit_confirm','goal_pause','goal_resume','goal_complete','goal_clear'].includes(value.action)) {
+          try { this.codex.assertExternalControlAllowed?.(value.sessionId); } catch (error) { return toastResponse(formatFeishuError(error), 'error'); }
+        }
         const projects = await this.getProjects();
         if (value.action === 'projects_page') return cardResponse(projectCard(projects, Number(value.page) || 0));
         if (value.action === 'project_sync') {
@@ -543,16 +666,7 @@ export class FeishuGateway {
       if (threadId && notification.method === 'thread/goal/cleared') {
         this.goals.delete(threadId); this.saveState(); this.scheduleControlCardUpdate('goal', threadId);
       }
-      if (threadId) {
-        const state = this.tasks.get(threadId);
-        if (state) {
-          state.lastActivityAt = Date.now();
-          state.turnId = notification.params?.turn?.id ?? state.turnId;
-          state.detail = summarizeNotification(notification);
-          if (notification.method === 'turn/completed') state.status = notification.params?.turn?.status === 'failed' ? 'failed' : notification.params?.turn?.status === 'interrupted' ? 'stopped' : 'completed';
-          await this.updateTaskCard(threadId).catch((error) => logger.error('card_update_failed', error, { threadId }));
-        }
-      }
+      if (threadId) await this.handleTaskStatusNotification(threadId, notification);
       if (notification.method !== 'turn/completed') return;
       const completedTurnId = notification.params?.turn?.id;
       // 只有从飞书桥接发起的回合才直接视为已展示。Desktop 发起的
@@ -587,6 +701,7 @@ export class FeishuGateway {
         } else {
           await client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: target.chatId, msg_type: 'text', content } });
         }
+        if (turn) await this.sendTurnImages(client, target, turn, threadId, this.tasks.get(threadId)?.startedAt);
       } catch (error) { console.error('[feishu-notify]', error); }
       await this.runNext(threadId);
     });
@@ -606,7 +721,8 @@ export class FeishuGateway {
     try {
       const threads = await this.codex.listThreads();
       for (const thread of threads) {
-        const group = this.projectGroups.get(thread.cwd);
+        const boundTopic = this.sessionTopics.get(thread.id);
+        const group = this.projectGroups.get(thread.cwd) ?? (boundTopic ? [...this.projectGroups.values()].find(item => item.chatId === boundTopic.chatId) : undefined);
         if (!group) continue;
         // thread/list 的 turns 通常为空（itemsView=notLoaded），必须读取完整
         // Session 才能发现由 Codex Desktop 产生的新回合。
@@ -641,6 +757,7 @@ export class FeishuGateway {
             }});
             if (sent.data?.message_id) messageIds.push(sent.data.message_id);
           }
+          await this.sendTurnImages(this.client, { chatId: topic.chatId, openId: '', rootMessageId: topic.rootMessageId }, turn, thread.id);
           logger.info('desktop_turn_synced', { sessionId: thread.id, turnId: turn.id, messageIds, messageCount: messages.length, rootMessageId: topic.rootMessageId });
           this.markTurnSynced(thread.id, turn.id);
         }
@@ -783,6 +900,7 @@ export class FeishuGateway {
 
   private async handleSessionControl(sessionId: string, input: string, target: Target): Promise<Reply> {
     const [command, action = '', ...rest] = input.trim().split(/\s+/);
+    if (!['/stop','/diff','/files','/skills','/apps'].includes(command)) this.codex.assertExternalControlAllowed?.(sessionId);
     if (command === '/stop') { await this.stopTask(sessionId); return '已发送停止指令。'; }
     if (command === '/retry') {
       const state = this.tasks.get(sessionId);
@@ -946,6 +1064,7 @@ export class FeishuGateway {
   }
 
   private async enqueue(sessionId: string, text: string, target: Target, createCard = true) {
+    this.codex.assertExternalControlAllowed?.(sessionId);
     this.targets.set(sessionId, target);
     const current = this.tasks.get(sessionId);
     if (current?.status === 'running') {
@@ -990,17 +1109,25 @@ export class FeishuGateway {
   private async sendTaskCard(sessionId: string, target: Target, _status: TaskState['status']) {
     if (!this.client || !target.chatId) return;
     const content = JSON.stringify(await this.taskCard(sessionId));
+    const state = this.tasks.get(sessionId);
+    const dedupe = state?.managedIssue ? { uuid: `issue-progress-${createHash('sha256').update(sessionId).digest('hex').slice(0, 32)}` } : {};
     const result = target.rootMessageId
-      ? await this.client.im.message.reply({ path: { message_id: target.rootMessageId }, data: { msg_type: 'interactive', content } })
-      : await this.client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: target.chatId, msg_type: 'interactive', content } });
+      ? await this.client.im.message.reply({ path: { message_id: target.rootMessageId }, data: { msg_type: 'interactive', content, ...dedupe } })
+      : await this.client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: target.chatId, msg_type: 'interactive', content, ...dedupe } });
     const messageId = (result as any).data?.message_id;
-    const state = this.tasks.get(sessionId); if (state && messageId) state.cardMessageId = messageId;
+    if (state?.managedIssue && ((result as any).code || !messageId)) throw new Error('飞书未返回 Issue 进度卡消息 ID');
+    if (state && messageId) {
+      const current = this.tasks.get(sessionId);
+      if (state.managedIssue && current?.managedIssue) current.cardMessageId = messageId;
+      else state.cardMessageId = messageId;
+    }
   }
 
   private async updateTaskCard(sessionId: string) {
     const state = this.tasks.get(sessionId);
     if (!state?.cardMessageId || !this.client) return;
-    await (this.client.im.message as any).patch({ path: { message_id: state.cardMessageId }, data: { content: JSON.stringify(await this.taskCard(sessionId)) } });
+    const result = await (this.client.im.message as any).patch({ path: { message_id: state.cardMessageId }, data: { content: JSON.stringify(await this.taskCard(sessionId)) } });
+    if (state.managedIssue && result?.code) throw new Error(`更新 Issue 进度卡失败：${result.msg ?? result.code}`);
   }
 
   private async taskCard(sessionId: string): Promise<Card> {
@@ -1014,9 +1141,9 @@ export class FeishuGateway {
     const actions: Array<Record<string, unknown>> = [
       { tag: 'button', text: { tag: 'plain_text', content: '刷新' }, value: { action: 'task_refresh', sessionId } },
     ];
-    if (status === 'running') actions.unshift({ tag: 'button', type: 'danger', text: { tag: 'plain_text', content: '停止' }, value: { action: 'task_stop', sessionId } });
-    if (status === 'failed' || status === 'timeout') actions.unshift({ tag: 'button', type: 'primary', text: { tag: 'plain_text', content: '重试' }, value: { action: 'task_retry', sessionId } });
-    return { config: { wide_screen_mode: true, update_multi: true }, header: { template: status === 'failed' || status === 'timeout' ? 'red' : status === 'completed' ? 'green' : 'blue', title: { tag: 'plain_text', content: `Codex · ${labels[status] ?? status}` } }, elements: [
+    if (status === 'running' && (!state?.managedIssue || state.issueStage === 'DEVELOPING')) actions.unshift({ tag: 'button', type: 'danger', text: { tag: 'plain_text', content: '停止' }, value: { action: 'task_stop', sessionId } });
+    if (!state?.managedIssue && (status === 'failed' || status === 'timeout')) actions.unshift({ tag: 'button', type: 'primary', text: { tag: 'plain_text', content: '重试' }, value: { action: 'task_retry', sessionId } });
+    return { config: { wide_screen_mode: true, update_multi: true }, header: { template: status === 'failed' || status === 'timeout' ? 'red' : status === 'completed' ? 'green' : 'blue', title: { tag: 'plain_text', content: `Codex · ${state?.managedIssue && state.issueStage === 'PR_NOTIFIED' ? 'PR 待审核' : labels[status] ?? status}` } }, elements: [
       { tag: 'div', text: { tag: 'lark_md', content: `**Session**\n${sessionId}\n\n**运行时间** ${elapsed}s　**队列** ${queued}` } },
       { tag: 'div', text: { tag: 'lark_md', content: String(detail).slice(0, 3000) } },
       { tag: 'action', actions },
@@ -1041,7 +1168,7 @@ export class FeishuGateway {
     const timeoutMs = Number(process.env.FEISHU_IDLE_TIMEOUT_MINUTES ?? 15) * 60_000;
     if (!timeoutMs) return;
     for (const [sessionId, state] of this.tasks) {
-      if (state.status !== 'running' || Date.now() - state.lastActivityAt < timeoutMs) continue;
+      if (state.managedIssue || state.status !== 'running' || Date.now() - state.lastActivityAt < timeoutMs) continue;
       state.status = 'timeout'; state.detail = `超过 ${Math.round(timeoutMs / 60_000)} 分钟没有新事件，已自动停止。`;
       try { await this.stopTask(sessionId); state.status = 'timeout'; } catch { /* turn may already be done */ }
       await this.updateTaskCard(sessionId).catch(() => undefined);
@@ -1185,10 +1312,49 @@ export class FeishuGateway {
     return dir;
   }
 
+  private async sendTurnImages(client: lark.Client, target: Target, turn: any, threadId?: string, startedAt?: number) {
+    for (const imagePath of extractTurnImagePaths(turn, threadId, startedAt)) {
+      try {
+        const uploaded: any = await client.im.v1.image.create({ data: { image_type: 'message', image: fs.createReadStream(imagePath) } });
+        const imageKey = uploaded?.image_key ?? uploaded?.data?.image_key;
+        if (!imageKey) throw new Error('飞书上传图片未返回 image_key');
+        const data = { msg_type: 'image', content: JSON.stringify({ image_key: imageKey }) };
+        if (target.rootMessageId) await client.im.message.reply({ path: { message_id: target.rootMessageId }, data });
+        else await client.im.message.create({ params: { receive_id_type: 'chat_id' }, data: { receive_id: target.chatId, ...data } });
+        logger.info('turn_image_sent', { imagePath, threadRootMessageId: target.rootMessageId });
+      } catch (error) {
+        logger.error('turn_image_send_failed', error, { imagePath });
+      }
+    }
+  }
+
   private async parseIncomingMessage(client: lark.Client, message: any, messageType: string): Promise<string> {
     let content: any = {};
     try { content = JSON.parse(message.content ?? '{}'); } catch { return ''; }
     if (messageType === 'text') return content.text?.trim() ?? '';
+    // 在飞书编辑器里粘贴图片后，消息会由 text/image 变成富文本 post。
+    // post 中的图片仍然需要通过 messageResource 下载，不能只读取文本，否则
+    // 纯图片消息会被当成空消息，而“图片 + /new”也会丢失附件。
+    if (messageType === 'post') {
+      const localeContent = content.zh_cn ?? content.en_us ?? content.ja_jp ?? content;
+      const paragraphs = Array.isArray(localeContent?.content) ? localeContent.content : [];
+      const parts: string[] = [];
+      if (typeof localeContent?.title === 'string' && localeContent.title.trim()) parts.push(localeContent.title.trim());
+      for (const paragraph of paragraphs) {
+        const line: string[] = [];
+        for (const element of Array.isArray(paragraph) ? paragraph : []) {
+          if ((element?.tag === 'text' || element?.tag === 'a') && typeof element.text === 'string') line.push(element.text);
+          if (element?.tag === 'at' && element.user_name) line.push(`@${element.user_name}`);
+          const imageKey = element?.image_key ?? element?.img_key;
+          if ((element?.tag === 'img' || imageKey) && imageKey) {
+            const localPath = await this.downloadMessageResource(client, message, imageKey, 'image');
+            if (localPath) line.push(`\n请处理我粘贴的图片。本地路径：${localPath}\n`);
+          }
+        }
+        if (line.join('').trim()) parts.push(line.join('').trim());
+      }
+      return parts.join('\n').trim();
+    }
     const key = content.file_key ?? content.image_key;
     if (!key || !['file', 'image', 'audio', 'media'].includes(messageType)) return '';
     const safeName = path.basename(content.file_name || `${messageType}-${Date.now()}${messageType === 'image' ? '.png' : ''}`).replace(/[^\p{L}\p{N}._-]+/gu, '_');
@@ -1211,6 +1377,30 @@ export class FeishuGateway {
     } catch (error) {
       logger.error('attachment_download_failed', error, { messageType });
       if (this.client && message.message_id) await this.client.im.message.reply({ path: { message_id: message.message_id }, data: { msg_type: 'text', content: JSON.stringify({ text: `❌ 附件下载失败：${formatFeishuError(error)}` }) } }).catch(() => undefined);
+      return '';
+    }
+  }
+
+  private async downloadMessageResource(client: lark.Client, message: any, key: string, type: 'image' | 'file'): Promise<string> {
+    const safeName = `${type}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${type === 'image' ? '.png' : ''}`;
+    const sessionDir = path.join(this.ensureMediaDir(), String(message.chat_id || 'unknown'));
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const destination = path.join(sessionDir, safeName);
+    try {
+      const api: any = (client.im as any).messageResource;
+      const response = await api.get({ path: { message_id: message.message_id, file_key: key }, params: { type } });
+      const payload = response?.data ?? response;
+      if (Buffer.isBuffer(payload)) fs.writeFileSync(destination, payload);
+      else if (payload?.writeFile) await payload.writeFile(destination);
+      else if (payload?.getReadableStream) {
+        const chunks: Buffer[] = [];
+        for await (const chunk of payload.getReadableStream()) chunks.push(Buffer.from(chunk));
+        fs.writeFileSync(destination, Buffer.concat(chunks));
+      } else throw new Error('飞书未返回可写入的附件内容');
+      logger.info('attachment_downloaded', { messageType: type, destination, richText: true });
+      return destination;
+    } catch (error) {
+      logger.error('attachment_download_failed', error, { messageType: type, richText: true });
       return '';
     }
   }
@@ -1369,6 +1559,7 @@ export class FeishuGateway {
       this.targets = new Map(data.targets ?? []);
       this.projectGroups = new Map(data.projectGroups ?? []);
       this.sessionTopics = new Map(data.sessionTopics ?? []);
+      this.issueTaskCardIds = new Map(data.issueTaskCardIds ?? []);
       this.evaluationHubTopics = new Map(data.evaluationHubTopics ?? []);
       this.evaluationTasklistGuid = (data.evaluationTasklistGuid ?? []).map((entry: any) => Array.isArray(entry) ? entry[1] : entry).find(Boolean);
       this.handledMessages = (data.handledMessages ?? []).map((entry: any) => Array.isArray(entry) ? entry[1] : entry);
@@ -1390,7 +1581,7 @@ export class FeishuGateway {
 
   private saveState() {
     this.stateStore.saveSnapshot({
-      selected: [...this.selected], targets: [...this.targets], projectGroups: [...this.projectGroups], sessionTopics: [...this.sessionTopics], evaluationHubTopics: [...this.evaluationHubTopics], handledMessages: this.handledMessages,
+      selected: [...this.selected], targets: [...this.targets], projectGroups: [...this.projectGroups], sessionTopics: [...this.sessionTopics], issueTaskCardIds: [...this.issueTaskCardIds], evaluationHubTopics: [...this.evaluationHubTopics], handledMessages: this.handledMessages,
       documentBindings: [...this.documentBindings], commentSessions: [...this.commentSessions], commentTargets: [...this.commentTargets], commentQueues: [...this.commentQueues], handledComments: this.handledComments,
       syncedTurns: [...this.syncedTurns],
       pendingReferences: [...this.pendingReferences],
@@ -1430,10 +1621,16 @@ function formatTurnStatus(threadId: string, turn: Awaited<ReturnType<CodexClient
   return `Session：${threadId}\n状态：${labels[turn.status] ?? turn.status}\n\n${String(detail).slice(0, 3500)}`;
 }
 
-function summarizeNotification(notification: any): string {
+export function summarizeNotification(notification: any): string {
   const method = String(notification.method ?? '');
   const item = notification.params?.item ?? notification.params?.turn?.items?.at?.(-1);
   if (item?.type === 'agentMessage' && item.text) return String(item.text).slice(0, 3000);
+  if (method.startsWith('item/commandExecution/')) return '正在执行命令或测试。';
+  if (method.startsWith('item/fileChange/')) return '正在修改项目文件。';
+  if (method.startsWith('item/reasoning/')) return '正在分析任务。';
+  if (item?.type === 'commandExecution') return '正在执行命令或测试。';
+  if (item?.type === 'fileChange') return '正在修改项目文件。';
+  if (method === 'item/agentMessage/delta') return '正在生成进度说明。';
   if (item?.tool || /ToolCall$/.test(item?.type ?? '')) return `正在执行：${item.tool ?? item.type}`;
   if (method === 'turn/started') return '任务已经开始执行。';
   if (method === 'turn/completed') return `任务已${notification.params?.turn?.status === 'failed' ? '失败' : '完成'}。`;
@@ -1727,6 +1924,34 @@ export function formatDesktopTurnMessages(turn: any, maxLength = 3500): string[]
     messages.push(`${index === 0 ? 'Codex：' : 'Codex（续）：'}\n${part}`);
   }
   return messages;
+}
+
+export function extractTurnImagePaths(turn: any, threadId?: string, startedAt?: number): string[] {
+  const paths = new Set<string>();
+  const agentItems = (turn?.items ?? []).filter((item: any) => item?.type === 'agentMessage');
+  for (const item of agentItems) {
+    const text = String(item?.text ?? '');
+    // Codex 图片结果通常会在最终回复中以绝对路径 Markdown 图片呈现。
+    for (const match of text.matchAll(/!\[[^\]]*\]\(([^)]+)\)/g)) {
+      let candidate = match[1].trim().replace(/^<|>$/g, '');
+      try { candidate = decodeURIComponent(candidate.replace(/^file:\/\//, '')); } catch { /* 保留原路径 */ }
+      if (path.isAbsolute(candidate) && fs.existsSync(candidate) && /\.(png|jpe?g|webp|gif|bmp|ico|tiff?|heic)$/i.test(candidate)) paths.add(candidate);
+    }
+  }
+  // ImageGen 的结果不一定写入最终回复；Codex 会把它保存到线程专属目录。
+  // 飞书发起的回合有 startedAt，因此只回传本轮新生成的文件，避免把历史图重复发送。
+  if (threadId && startedAt) {
+    const generatedDir = path.join(process.env.HOME ?? '', '.codex', 'generated_images', threadId);
+    if (fs.existsSync(generatedDir)) {
+      for (const name of fs.readdirSync(generatedDir)) {
+        const candidate = path.join(generatedDir, name);
+        try {
+          if (/\.(png|jpe?g|webp|gif)$/i.test(name) && fs.statSync(candidate).mtimeMs >= startedAt - 2_000) paths.add(candidate);
+        } catch { /* 文件可能正被清理 */ }
+      }
+    }
+  }
+  return [...paths];
 }
 
 function chunkText(value: string, size: number): string[] {

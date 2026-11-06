@@ -16,12 +16,17 @@ import { BatchService } from './evaluation/batch-service.js';
 import { PlanService } from './evaluation/plan-service.js';
 import { EvaluationScheduler } from './evaluation/scheduler.js';
 import { EvaluationResultProcessor } from './evaluation/result-processor.js';
+import { IssueStore } from './issue-auto/store.js';
+import { readIssueConfig } from './issue-auto/config.js';
+import { createIssueAutomation } from './issue-auto/boot.js';
 import { BaseSyncService, LarkEvaluationBaseApi } from './evaluation/base-sync.js';
 
 try { process.loadEnvFile(); } catch { /* .env 可选 */ }
 
 const app = Fastify({ logger: true });
 const codex = new CodexClient(); const auth = new AuthStore();
+const issueGuardStore = new IssueStore(process.env.CODEXREACH_STATE_DB ? path.resolve(process.env.CODEXREACH_STATE_DB) : path.resolve('.data/feishu-state.sqlite'));
+codex.setIssueSessionGuard(id => issueGuardStore.isManagedSession(id));
 await auth.init(); await codex.start();
 await app.register(websocket);
 
@@ -249,9 +254,20 @@ app.setNotFoundHandler((request, reply) => request.url.startsWith('/api/') ? rep
 
 function localIp() { return Object.values(os.networkInterfaces()).flat().find((i) => i?.family === 'IPv4' && !i.internal)?.address ?? '127.0.0.1'; }
 const host = process.env.HOST ?? '0.0.0.0', port = Number(process.env.PORT ?? 4317);
-feishu.start();
+const feishuReady = feishu.start();
 evaluationScheduler.start();
+let issueAutomation: ReturnType<typeof createIssueAutomation> | undefined;
+app.addHook('onClose', async () => { if (issueAutomation) await issueAutomation.stop(); codex.setIssueSessionGuard(); issueGuardStore.close(); });
 await app.listen({ host, port });
+try {
+  const issueConfig = readIssueConfig(process.env);
+  if (issueConfig) {
+    if (!feishuReady) throw new Error('飞书客户端未启用');
+    issueAutomation = createIssueAutomation(issueConfig, codex, feishu, () => logger.warn('issue_auto_step_failed'));
+    issueAutomation.start();
+    logger.info('issue_auto_started');
+  }
+} catch { logger.warn('issue_auto_disabled_invalid_config'); }
 const url = `http://${localIp()}:${port}`; const code = auth.rotatePairCode();
 app.log.info(`手机控制台：${url}  配对码：${code}`);
 app.log.info(`配对二维码：\n${await QRCode.toString(`${url}?pair=${code}`, { type: 'terminal', small: true })}`);

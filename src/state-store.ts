@@ -24,7 +24,7 @@ export class StateStore {
 
   constructor(
     readonly databasePath = path.resolve('.data/feishu-state.sqlite'),
-    private readonly legacyJsonPath = path.resolve('.data/feishu-state.json'),
+    private readonly legacyJsonPath = path.resolve(process.env.CODEXREACH_LEGACY_STATE_JSON ?? '.data/feishu-state.json'),
   ) {
     fs.mkdirSync(path.dirname(databasePath), { recursive: true });
     this.db = new Database(databasePath);

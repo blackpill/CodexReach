@@ -1,0 +1,8 @@
+{
+  "name": "codexreach-issue-queue",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "vars": { "REPOSITORY_ID": "1444221313", "ACTOR_ID": "1231245" },
+  // Bind a D1 database as DB before deploying. Set WEBHOOK_SECRET and RUNNER_SECRET as secrets.
+  "d1_databases": [],
+}
