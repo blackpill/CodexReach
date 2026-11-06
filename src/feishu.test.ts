@@ -357,3 +357,13 @@ describe('正式关键通知的单聊与定位',()=>{
   await g.sendIssueDirectNotice({recipient:'ou_user',message:'PR：https://github.com/blackpill/usmapgames.com/pull/10\n测试：http://192.168.3.16:8801/',link,uuid:'stable'});const request=create.mock.calls[0][0];expect(request.params.receive_id_type).toBe('open_id');expect(request.data.msg_type).toBe('post');const content=JSON.parse(request.data.content);const links=content.zh_cn.content.flat().filter((x:any)=>x.tag==='a').map((x:any)=>x.href);expect(links).toContain(link);expect(links).toContain('http://192.168.3.16:8801/');expect(request.data.uuid).toBe('stable');
  });
 });
+
+
+it('renders the explicitly allowed colorearmundo GitHub link in a direct notice', async () => {
+  const { directNoticeContent } = await import('./issue-auto/feishu-notice.js');
+  const url = 'https://github.com/blackpill/colorearmundo.com/pull/12';
+  const body = JSON.stringify(directNoticeContent(url, 'https://applink.feishu.cn/client/thread/open'));
+  expect(body).toContain(`\"href\":\"${url}\"`);
+  const unsafe = JSON.stringify(directNoticeContent('https://github.com/blackpill/colorearmundo.com.evil/pull/1', 'https://applink.feishu.cn/client/thread/open'));
+  expect(unsafe).not.toContain('\"tag\":\"a\",\"text\":\"https://github.com/blackpill/colorearmundo.com.evil');
+});

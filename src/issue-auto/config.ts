@@ -165,10 +165,13 @@ export function readIssueConfig(
 const identities: Record<number, string> = {
   1444221313: 'usmapgames.com',
   1223017142: 'classgames.net',
+  1316936114: 'colorearmundo.com',
+  1336698184: 'BluetoothClicker',
+  1356671174: 'endoscope-iOS',
 };
 function parseProjects(raw: string): ProjectConfig[] {
   const entries: unknown = JSON.parse(raw);
-  if (!Array.isArray(entries) || !entries.length || entries.length > 2)
+  if (!Array.isArray(entries) || !entries.length || entries.length > 5)
     throw Error('invalid project list');
   const ids = new Set<number>(),
     paths = new Set<string>();
@@ -202,8 +205,10 @@ function parseProjects(raw: string): ProjectConfig[] {
       (value.previewEnabled !== undefined && typeof value.previewEnabled !== 'boolean')
     )
       throw Error('invalid project configuration');
-    if (value.repositoryId === 1223017142 && value.previewEnabled === true)
-      throw Error('classgames preview contract is not available');
+    if ([1336698184, 1356671174].includes(value.repositoryId) && value.enabled)
+      throw Error('new project execution is not yet verified');
+    if (value.repositoryId !== 1444221313 && value.previewEnabled === true)
+      throw Error('project preview contract is not available');
     const command = (c: any): ValidationCommand => {
       if (
         !c ||
