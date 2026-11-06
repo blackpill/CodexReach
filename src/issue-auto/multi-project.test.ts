@@ -427,3 +427,32 @@ it('rechecks repository ID before publishing and never pushes a renamed/reclaime
   ).rejects.toThrow('repository identity');
   expect(pushed).toBe(false);
 });
+
+it('accepts the three new explicitly pinned repositories and rejects mismatched IDs', () => {
+  const additions = [
+    { repositoryId: 1316936114, repo: 'colorearmundo.com' },
+    { repositoryId: 1336698184, repo: 'BluetoothClicker' },
+    { repositoryId: 1356671174, repo: 'endoscope-iOS' },
+  ];
+  for (const item of additions) {
+    const entry = { ...project, ...item, enabled: false, projectPath: `/private/${item.repo}`,
+      expectedRemote: `git@github.com:blackpill/${item.repo}.git` };
+    const config = readIssueConfig({ ...env, ISSUE_AUTO_PROJECTS_JSON: JSON.stringify([entry]) });
+    expect(config?.projects?.[0]).toMatchObject(item);
+    if (item.repo !== 'colorearmundo.com') expect(() => readIssueConfig({ ...env, ISSUE_AUTO_PROJECTS_JSON: JSON.stringify([{ ...entry, enabled: true }]) })).toThrow('not yet verified');
+    expect(() => readIssueConfig({ ...env, ISSUE_AUTO_PROJECTS_JSON: JSON.stringify([{ ...entry, repositoryId: 999 }]) })).toThrow();
+  }
+  const entries = [project, { ...project, repositoryId: 1444221313, repo: 'usmapgames.com', projectPath: '/private/usmap', expectedRemote: 'git@github.com:blackpill/usmapgames.com.git' },
+    ...additions.map((item) => ({ ...project, ...item, enabled: false, projectPath: `/private/${item.repo}`, expectedRemote: `git@github.com:blackpill/${item.repo}.git` }))];
+  expect(readIssueConfig({ ...env, ISSUE_AUTO_PROJECTS_JSON: JSON.stringify(entries) })?.projects).toHaveLength(5);
+});
+
+
+it('accepts colorearmundo when explicitly enabled but rejects its unaudited preview', () => {
+  const color = { ...project, enabled: true, repositoryId: 1316936114, repo: 'colorearmundo.com',
+    projectPath: '/private/colorearmundo.com', expectedRemote: 'https://github.com/blackpill/colorearmundo.com.git',
+    packageManager: 'npm', install: { executable: 'npm', args: ['ci'] },
+    validate: [{ executable: 'npm', args: ['test'] }], build: { executable: 'npm', args: ['run', 'build'] }, previewEnabled: false };
+  expect(readIssueConfig({ ...env, ISSUE_AUTO_PROJECTS_JSON: JSON.stringify([color]) })?.projects?.[0]).toMatchObject({ enabled: true, previewEnabled: false });
+  expect(() => readIssueConfig({ ...env, ISSUE_AUTO_PROJECTS_JSON: JSON.stringify([{...color, previewEnabled:true}]) })).toThrow();
+});

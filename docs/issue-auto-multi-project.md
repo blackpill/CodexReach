@@ -1,5 +1,9 @@
 # Issue Auto 多项目接入（尚未部署）
 
+> 2026-11-07 开发变更：Runner 配置新增 `blackpill/colorearmundo.com`（1316936114），Mac 执行快照允许同步该仓库；Android 与 iOS 项目仍不可启用，新增项目预览仍关闭。这是代码能力，不代表生产已启用：必须先验证 main 的 `verify`、配置专属 CodexReach 群、审核部署 Runner，再配置 Worker allowlist 和 GitHub webhook，最后由用户人工添加 Auto 验收。下文仅描述原两仓部署及历史条件。
+
+> 发送端快照允许列表扩容前，必须先检查云端接收器的 `projects.json` 已登记并核实该项目的仓库 ID 和名称。接收器对未知仓库整批拒绝；如果顺序反了，混合批次会同时阻断旧项目快照。只在接收端登记并验证后部署发送端，部署后分别验证两个旧项目与新项目的快照流转。
+
 ## 已实现与未启用
 
 - 一个 Worker/D1 队列，一个 Mac IssueStore/IssueService，一个 PID 单实例锁，一个持久开发 Turn 执行槽。不能为每仓启动独立 Runner 或配置不同 DB 来绕开全局串行。
