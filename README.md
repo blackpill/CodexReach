@@ -163,3 +163,36 @@ EVALUATION_BASE_RESULT_TABLE_ID=<评估结果 table_id>
 ## 安全说明
 
 服务仅用于可信局域网。务必配置 `FEISHU_ALLOWED_OPEN_IDS`。完全自动模式能读写本机文件并控制屏幕，不应在公共 Wi-Fi 使用。删除 `.data/auth.json` 并重启服务可撤销所有已配对浏览器。
+
+## GitHub Issue Auto（试点，默认关闭）
+
+Issue Auto 仅试点 `blackpill/usmapgames.com`，且只接受 `blackpill` 对 `Auto` 标签的可信触发。 每个受管 Session 在对应飞书话题中维护一张进度卡，展示 Codex 活动以及本地验证、PR 和 CI 阶段；单个 Turn 结束不代表 Issue 已完成。进度卡采用节流和串行更新，卡片发送失败不会中断自动任务。GitHub Webhook 由独立 Cloudflare Worker 验签后写入 D1；Mac 通过 HTTPS 领取任务，在本地 SQLite 落库后确认。Issue 的 `Auto` 任务使用独立 worktree，不自动合并、部署或关闭 Issue。
+
+**2026-11-05 已在独立测试中验证 Webhook 404 → 自动重投 200，以及 CI 失败 → 读取完整日志 → 自动修复 → CI 通过。** **GitHub 不会自行重投失败的 Webhook。** 配置 `ISSUE_AUTO_WEBHOOK_ID` 后，服务会在运行时约每 5 分钟检查投递记录，按 GUID 去重并有限重投；连续失败、长期无法检查或超过 GitHub 可重投窗口时会发送飞书告警。服务停机期间无法检查，超过 3 天的投递可能无法自动恢复。Mac 本地磁盘丢失后的任务恢复、Runner 突然退出时的子进程清理，以及完整 secret 扫描仍有限制。
+
+上线前需要：
+
+1. 在试点仓库配置并验证 PR CI；把具体必需 check 名称、CI 超时和 Webhook ID 填入 `.env`。没有检查不算通过；GitHub 凭据需要读取及重投仓库 Webhook 的权限。
+2. 在 Cloudflare 创建 D1 数据库、应用 `worker/migrations/0001_tasks.sql` 并将其绑定为 `DB`；在 Worker secrets 中设置 `WEBHOOK_SECRET` 和与之不同的 `RUNNER_SECRET`，验证 GitHub 签名及失败投递补偿。`worker/wrangler.jsonc` 的 D1 绑定目前为空，需要按自己的资源填写。
+3. 同步试点飞书项目群；确认运行用户具备对应仓库的 Git push、读取 Issue/CI 和创建 PR 权限，且本机的 `origin` 为 `https://github.com/blackpill/usmapgames.com.git`。
+4. 按 `.env.example` 配置队列 HTTPS URL、Runner secret、GitHub token、检查名和超时。可使用权限为 `0600` 的 `ISSUE_AUTO_QUEUE_SECRET_FILE` 与 `ISSUE_AUTO_USE_GH_AUTH=true`，避免把 token 明文写入环境文件。验证凭据与飞书通知后，只有明确接受 Codex `dangerFullAccess`（可访问用户文件、网络并执行项目代码）的风险，才设置 `ISSUE_AUTO_FULL_ACCESS_ACCEPTED=true` 并启用。
+
+本地验证在独立的临时 worktree 中进行，避免测试生成物污染任务分支；只允许两张已知测试截图变化，其余非预期修改仍会使验证失败。任务状态保存在现有 SQLite；不确定的安装、验证、Codex 启动或 PR 推送结果会进入阻塞并通知，而不会盲目重复副作用。飞书和本项目网页对 Issue 受管 Session 的发送、steer 和写操作会被拒绝，以免与自动任务并发；安全起见，即使任务已停止也不会自动解除该保护。此保护无法阻止 Codex Desktop 或其他程序直接操作同一个 Session 或 worktree。CI 修复会下载完整 GitHub Actions job 日志（上限 10 MiB）并以 0600 保存到 `.data/issue-auto-logs`，读取日志所用 GitHub token 需 Actions 读取权限；日志缺失、过大、下载失败或不是可识别的 GitHub Actions job 时，任务会阻塞，不会假装已获取证据。日志可能含隐私或凭据，即使已做部分脱敏也须限制访问。通知是至少一次投递，发送成功但响应丢失时可能重复。运行中断后的人工恢复、执行预算和故障处理详见设计文档 `docs/superpowers/specs/2026-11-05-github-issue-auto-supervisor-design.md`。
+
+### 局域网 PR 预览
+
+设置 `ISSUE_AUTO_LAN_PREVIEW_ENABLED=true` 后，只有 PR 最新提交通过指定 CI、独立构建及预览健康检查通过，飞书审核提醒才会附带局域网测试链接。现有待审核 PR 会补发链接。静态预览不运行 Worker/API，也不发布正式站点。
+
+- 每个 PR 使用独立端口，从 `ISSUE_AUTO_PREVIEW_FIRST_PORT`（默认 8800）开始分配，最多保留 `ISSUE_AUTO_PREVIEW_MAX`（默认 5）个；不占用测试的 8787。
+- `ISSUE_AUTO_PREVIEW_HOST` 留空会选择 Mac 物理网卡的私网 IPv4，仅监听该地址，不监听所有接口。IP 变化会在后续复核时更新链接；手机必须与 Mac 在可互通的可信局域网。无额外密码，其他局域网设备也可能访问。
+- Mac 需要开机、联网，且防火墙允许预览端口。飞书内置浏览器不支持时可用系统浏览器。关闭 PR 后在后续复核中停止监听并回收该 PR 的预览 worktree；服务重启会按持久状态恢复已完成构建的预览。
+- 预览构建仅使用绑定 SHA 的独立 worktree，显式 `DEPLOY_ENV=preview`，无生产 analytics，全部响应 noindex/no-store；源码、隐藏文件、外部符号链接不予提供。PR 状态失效时端点返回不可用，避免继续验收已知过期版本。
+- 构建失败、端口不足或网络异常会告警，不发送旧链接；中断且结果不明的构建需人工核对后恢复。依赖和构建产物会占用本机磁盘，关闭不再需要的 PR 可回收。
+
+### 关键事件的单聊提醒
+
+`ISSUE_AUTO_DM_NOTIFY_ENABLED=true` 时，Issue Auto 的测试链接就绪、PR 审核就绪、阻塞及系统告警均先在 Topic 留档，再向唯一配置用户发送机器人单聊。普通进度只更新 Topic 卡片，不推送单聊，不使用短信/电话加急。接收人由 `ISSUE_AUTO_NOTIFY_OPEN_ID` 指定且必须在 `FEISHU_ALLOWED_OPEN_IDS` 中；仅当允许名单恰好一人时可留空，绝不广播。
+
+单聊包含 PR/测试链接和“查看话题最新消息（本次通知）”入口，使用本条新发出的 Topic 消息位置，必要时只查询该条消息，不依赖用户 CLI 或群历史读取权限。链接定位的是发送时的对应消息，不会在今后点击时动态追踪到底部。
+
+Topic 和单聊分别保存 SQLite 回执；单聊失败时不重复发送已确认成功的 Topic 记录。每渠道使用稳定 UUID 尽量避免响应丢失后的重复，但跨平台仍无法保证绝对恰好一次。消息定位不可用时保留重试，不静默退回话题开头。是否弹出手机通知仍受用户飞书/系统通知及免打扰设置影响。

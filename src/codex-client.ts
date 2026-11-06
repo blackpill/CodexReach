@@ -31,6 +31,7 @@ export class CodexClient extends EventEmitter {
   private starting?: Promise<void>;
   private reconnectTimer?: NodeJS.Timeout;
   private stopping = false;
+  private issueSessionGuard?: (threadId:string)=>boolean;
   private sessionOptions = new Map<string, SessionOptions>();
 
   constructor(private readonly bin = process.env.CODEX_BIN || 'codex') { super(); }
@@ -106,7 +107,10 @@ export class CodexClient extends EventEmitter {
     return (await this.request('thread/resume', { threadId })).thread;
   }
 
-  async send(threadId: string, text: string) {
+  setIssueSessionGuard(guard?: (threadId:string)=>boolean) { this.issueSessionGuard = guard; }
+  assertExternalControlAllowed(threadId:string) { if(this.issueSessionGuard?.(threadId)) throw new Error('该 Session 由 Issue 自动任务管理，请在其他 Session 操作；需要接管时先停止自动任务并核对进程。'); }
+  async send(threadId: string, text: string) { this.assertExternalControlAllowed(threadId); return this.sendManaged(threadId,text); }
+  async sendManaged(threadId: string, text: string) {
     const thread = await this.readThread(threadId);
     const input = await this.resolveInput(thread.cwd, text);
     const options = this.sessionOptions.get(threadId) ?? {};
@@ -180,6 +184,7 @@ export class CodexClient extends EventEmitter {
   }
 
   async steer(threadId: string, text: string) {
+    this.assertExternalControlAllowed(threadId);
     const thread = await this.readThread(threadId);
     const turn = [...thread.turns].reverse().find((item) => item.status === 'inProgress');
     if (!turn) throw new Error('当前没有可追加指令的运行中任务');

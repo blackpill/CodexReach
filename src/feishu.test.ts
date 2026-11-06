@@ -1,9 +1,13 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { FeishuGateway, extractTurnImagePaths, formatDesktopTurn, formatDesktopTurnMessages, parseDocumentUrl, parseNewCommand, searchProjectFiles } from './feishu.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { EvaluationDraft } from './evaluation/batch-service.js';
+
+const isolatedStateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codexreach-feishu-tests-'));
+beforeAll(() => { vi.stubEnv('CODEXREACH_STATE_DB', path.join(isolatedStateDir, 'state.sqlite')); vi.stubEnv('CODEXREACH_LEGACY_STATE_JSON', path.join(isolatedStateDir, 'missing.json')); });
+afterAll(() => { vi.unstubAllEnvs(); fs.rmSync(isolatedStateDir, { recursive: true, force: true }); });
 
 describe('parseNewCommand', () => {
   const projectPath = '/Users/kenny/Documents/ChatGPT/Feishu AI Codex Bot';
@@ -223,4 +227,133 @@ describe('评估草稿路由', () => {
       else process.env.EVALUATION_DEFAULT_ASSIGNEE_OPEN_ID = previous;
     }
   });
+});
+
+describe('Issue Auto 通知', () => {
+  it('仅向已绑定的项目群发送，并在发送失败时抛出错误以便重试', async () => {
+    const gateway = new FeishuGateway({} as any) as any;
+    const create = vi.fn().mockResolvedValue({code:0});
+    gateway.client = {im:{message:{create}}};
+    gateway.projectGroups.set('/project',{projectPath:'/project',projectName:'Project',chatId:'chat'});
+    await gateway.sendIssueAutoNotice('/project', '需要审核 PR');
+    expect(create).toHaveBeenCalledTimes(1);
+    await expect(gateway.sendIssueAutoNotice('/missing','message')).rejects.toThrow('项目群');
+    create.mockResolvedValue({code:1,msg:'failure'});
+    await expect(gateway.sendIssueAutoNotice('/project','message')).rejects.toThrow('failure');
+  });
+});
+
+describe('Issue worktree 会话映射', () => {
+  it('将会话绑定到原项目群，并持久保存话题目标', async () => {
+    const gateway = new FeishuGateway({} as any) as any;
+    gateway.client = {}; gateway.projectGroups.set('/project',{projectPath:'/project',projectName:'P',chatId:'chat'});
+    gateway.ensureSessionTopic = vi.fn().mockResolvedValue({sessionId:'session',chatId:'chat',threadId:'topic',rootMessageId:'root'});
+    gateway.saveState = vi.fn();
+    await expect(gateway.bindIssueSession('/project','session','Issue #1')).resolves.toBe('topic');
+    expect(gateway.targets.get('session')).toMatchObject({chatId:'chat',rootMessageId:'root'});
+    expect(gateway.saveState).toHaveBeenCalled();
+    await expect(gateway.bindIssueSession('/unknown','session2','Issue')).rejects.toThrow('项目群');
+  });
+});
+it('Issue 通知优先回复到已绑定的话题', async () => {
+ const gateway=new FeishuGateway({} as any) as any;
+ const reply=vi.fn().mockResolvedValue({code:0});gateway.client={im:{message:{reply}}};
+ gateway.projectGroups.set('/p',{projectPath:'/p',projectName:'P',chatId:'chat'});
+ gateway.sessionTopics.set('s',{sessionId:'s',chatId:'chat',threadId:'topic',rootMessageId:'root'});
+ await gateway.sendIssueAutoNotice('/p','PR','s');expect(reply).toHaveBeenCalledWith(expect.objectContaining({path:{message_id:'root'}}));
+});
+it('managed Issue sessions reject manual queue and destructive controls before any side effects',async()=>{
+ const codex={assertExternalControlAllowed:vi.fn(()=>{throw Error('managed Issue')}),send:vi.fn()};
+ const gateway=new FeishuGateway(codex as any) as any;const target={chatId:'chat',openId:'user'};
+ await expect(gateway.enqueue('managed','please change code',target)).rejects.toThrow('managed Issue');
+ await expect(gateway.handleSessionControl('managed','/commit x',target)).rejects.toThrow('managed Issue');
+ expect(codex.send).not.toHaveBeenCalled();expect(gateway.tasks.has('managed')).toBe(false);
+});
+it('runs Feishu tests against a dedicated state database',()=>{
+ expect(process.env.CODEXREACH_STATE_DB).toBeTruthy();
+ expect(path.resolve(process.env.CODEXREACH_STATE_DB!)).not.toBe(path.resolve('.data/feishu-state.sqlite'));
+});
+describe('Issue 自动任务实时进度',()=>{
+ it('为已绑定的 Issue 会话创建进度卡，并跳过普通消息空闲超时',async()=>{
+  const gateway=new FeishuGateway({} as any) as any;gateway.recordBridgeTurn=vi.fn();
+  gateway.client={im:{message:{reply:vi.fn().mockResolvedValue({code:0,data:{message_id:'card'}})}}};
+  gateway.targets.set('issue-session',{chatId:'chat',openId:'',rootMessageId:'root'});
+  await gateway.recordIssueTurn('issue-session','turn');
+  expect(gateway.tasks.get('issue-session')).toMatchObject({turnId:'turn',status:'running',managedIssue:true,cardMessageId:'card'});
+  expect(gateway.client.im.message.reply).toHaveBeenCalledTimes(1);
+  gateway.tasks.get('issue-session').lastActivityAt=Date.now()-60*60*1000;gateway.stopTask=vi.fn();
+  await gateway.checkIdleTasks();expect(gateway.stopTask).not.toHaveBeenCalled();
+ });
+});
+it('Issue 阶段变化更新同一张卡且不会把单轮结束误报为任务完成',async()=>{
+ const gateway=new FeishuGateway({} as any) as any;gateway.recordBridgeTurn=vi.fn();gateway.saveState=vi.fn();
+ const reply=vi.fn().mockResolvedValue({code:0,data:{message_id:'card'}});const patch=vi.fn().mockResolvedValue({code:0});
+ gateway.client={im:{message:{reply,patch}}};gateway.targets.set('s',{chatId:'chat',openId:'',rootMessageId:'root'});
+ await gateway.recordIssueTurn('s','turn');await gateway.updateIssueStage('s','VALIDATING');
+ expect(reply).toHaveBeenCalledTimes(1);expect(gateway.tasks.get('s')).toMatchObject({managedIssue:true,status:'running',issueStage:'VALIDATING'});
+ expect(gateway.tasks.get('s').detail).toContain('验证');
+});
+it('CI 结果尚未完成提醒复核时，进度卡不提前宣称 PR 已可审核',async()=>{
+ const gateway=new FeishuGateway({} as any) as any;gateway.saveState=vi.fn();gateway.client={im:{message:{reply:vi.fn().mockResolvedValue({code:0,data:{message_id:'card'}})}}};gateway.targets.set('s',{chatId:'chat',openId:'',rootMessageId:'root'});
+ await gateway.updateIssueStage('s','PR_READY');expect(gateway.tasks.get('s')).toMatchObject({status:'running'});expect(gateway.tasks.get('s').detail).toContain('复核');
+});
+it('并发阶段更新复用同一进度卡并使用稳定去重标识',async()=>{
+ const gateway=new FeishuGateway({} as any) as any;gateway.recordBridgeTurn=vi.fn();gateway.saveState=vi.fn();let finish!:(x:any)=>void;
+ const reply=vi.fn((_payload:any)=>new Promise(resolve=>{finish=resolve}));gateway.client={im:{message:{reply,patch:vi.fn().mockResolvedValue({code:0})}}};gateway.targets.set('s',{chatId:'chat',openId:'',rootMessageId:'root'});
+ const one=gateway.recordIssueTurn('s','t');const two=gateway.updateIssueStage('s','DEVELOPING');await vi.waitFor(()=>expect(reply).toHaveBeenCalledTimes(1));
+ expect(reply.mock.calls[0][0].data.uuid).toMatch(/^issue-progress-[0-9a-f]{32}$/);finish({code:0,data:{message_id:'card'}});await Promise.all([one,two]);expect(gateway.issueTaskCardIds.get('s')).toBe('card');
+});
+it('发送进度卡等待飞书返回期间发生阶段切换时，仍保存卡片 ID',async()=>{
+ const gateway=new FeishuGateway({} as any) as any;gateway.recordBridgeTurn=vi.fn();gateway.saveState=vi.fn();let finish!:(x:any)=>void;
+ const reply=vi.fn((_payload:any)=>new Promise(resolve=>{finish=resolve}));gateway.client={im:{message:{reply,patch:vi.fn().mockResolvedValue({code:0})}}};gateway.targets.set('s',{chatId:'chat',openId:'',rootMessageId:'root'});
+ const first=gateway.recordIssueTurn('s','t');await vi.waitFor(()=>expect(reply).toHaveBeenCalledTimes(1));const second=gateway.updateIssueStage('s','VALIDATING');finish({code:0,data:{message_id:'card'}});await Promise.all([first,second]);
+ expect(gateway.issueTaskCardIds.get('s')).toBe('card');expect(gateway.tasks.get('s').cardMessageId).toBe('card');expect(gateway.tasks.get('s').issueStage).toBe('VALIDATING');
+});
+it('执行事件使用可读状态而不是暴露底层事件名',async()=>{
+ const {summarizeNotification}=await import('./feishu.js');
+ expect(summarizeNotification({method:'item/commandExecution/outputDelta'})).toContain('命令');
+ expect(summarizeNotification({method:'item/fileChange/outputDelta'})).toContain('文件');
+ expect(summarizeNotification({method:'item/reasoning/summaryTextDelta'})).toContain('分析');
+});
+it('Issue 执行事件刷新状态，单轮完成时仍显示任务继续推进',async()=>{
+ const gateway=new FeishuGateway({} as any) as any;gateway.recordBridgeTurn=vi.fn();gateway.saveState=vi.fn();gateway.client={im:{message:{reply:vi.fn().mockResolvedValue({code:0,data:{message_id:'card'}}),patch:vi.fn().mockResolvedValue({code:0})}}};gateway.targets.set('s',{chatId:'chat',openId:'',rootMessageId:'root'});
+ await gateway.recordIssueTurn('s','turn');await gateway.handleTaskStatusNotification('s',{method:'item/commandExecution/outputDelta',params:{}});
+ expect(gateway.tasks.get('s').detail).toContain('命令');
+ await gateway.handleTaskStatusNotification('s',{method:'turn/completed',params:{turn:{id:'turn',status:'completed'}}});
+ expect(gateway.tasks.get('s')).toMatchObject({status:'running',managedIssue:true});expect(gateway.tasks.get('s').detail).toContain('继续验证');
+});
+it('飞书拒绝更新 Issue 进度卡时返回错误而不是假报成功',async()=>{
+ const gateway=new FeishuGateway({} as any) as any;gateway.client={im:{message:{patch:vi.fn().mockResolvedValue({code:999,msg:'denied'})}}};gateway.tasks.set('s',{startedAt:Date.now(),lastActivityAt:Date.now(),status:'running',managedIssue:true,issueStage:'VALIDATING',detail:'验证中',cardMessageId:'card'});
+ await expect(gateway.updateTaskCard('s')).rejects.toThrow('denied');
+});
+it('进度卡更新串行发送，较慢的旧请求不能覆盖新状态',async()=>{
+ vi.useFakeTimers();try{
+  const gateway=new FeishuGateway({} as any) as any;gateway.recordBridgeTurn=vi.fn();gateway.saveState=vi.fn();let finish!:(x:any)=>void;
+  const patch=vi.fn().mockImplementationOnce(()=>new Promise(resolve=>{finish=resolve})).mockResolvedValue({code:0});
+  gateway.client={im:{message:{reply:vi.fn().mockResolvedValue({code:0,data:{message_id:'card'}}),patch}}};gateway.targets.set('s',{chatId:'chat',openId:'',rootMessageId:'root'});
+  await gateway.recordIssueTurn('s','t');await vi.advanceTimersByTimeAsync(2000);expect(patch).toHaveBeenCalledTimes(1);
+  await gateway.updateIssueStage('s','VALIDATING');await vi.advanceTimersByTimeAsync(5000);expect(patch).toHaveBeenCalledTimes(1);
+  finish({code:0});await vi.advanceTimersByTimeAsync(2000);expect(patch).toHaveBeenCalledTimes(2);
+ }finally{vi.useRealTimers();}
+});
+it('Issue 验证和 CI 阶段不展示无法安全执行的停止按钮',async()=>{
+ const gateway=new FeishuGateway({} as any) as any;
+ for(const stage of ['VALIDATING','CI_CHECKING']){gateway.tasks.set('s',{startedAt:Date.now(),lastActivityAt:Date.now(),status:'running',managedIssue:true,issueStage:stage,detail:'正在执行'});const card=await gateway.taskCard('s');const actions=card.elements.find((x:any)=>x.tag==='action').actions;expect(actions.map((x:any)=>x.value.action)).not.toContain('task_stop');}
+ gateway.tasks.set('s',{startedAt:Date.now(),lastActivityAt:Date.now(),status:'running',managedIssue:true,issueStage:'DEVELOPING',detail:'正在执行'});const card=await gateway.taskCard('s');expect(card.elements.find((x:any)=>x.tag==='action').actions.map((x:any)=>x.value.action)).toContain('task_stop');
+});
+it('Issue 阻塞卡不展示尚未接入的普通消息重试按钮',async()=>{
+ const gateway=new FeishuGateway({} as any) as any;gateway.tasks.set('s',{startedAt:Date.now(),lastActivityAt:Date.now(),status:'failed',managedIssue:true,issueStage:'BLOCKED',detail:'需要人工处理'});const card=await gateway.taskCard('s');expect(card.elements.find((x:any)=>x.tag==='action').actions.map((x:any)=>x.value.action)).not.toContain('task_retry');
+});
+describe('正式关键通知的单聊与定位',()=>{
+ it('回复 Topic 后返回本条消息的位置，并生成精准最新回复链接',async()=>{
+  const g=new FeishuGateway({} as any) as any;const reply=vi.fn().mockResolvedValue({code:0,data:{message_id:'om_sent',chat_id:'oc_chat',thread_id:'omt_thread',thread_message_position:'12'}});g.client={im:{message:{reply}}};g.projectGroups.set('/p',{chatId:'oc_chat'});g.sessionTopics.set('s',{chatId:'oc_chat',threadId:'omt_thread',rootMessageId:'om_root'});
+  const r=await g.sendIssueTopicRecord({projectPath:'/p',sessionId:'s',message:'ready',uuid:'dedupe'});const link=await g.resolveIssueTopicLink(r);expect(new URL(link).searchParams.get('thread_position')).toBe('12');expect(reply.mock.calls[0][0].data.uuid).toBe('dedupe');
+ });
+ it('仅查询刚发送的消息补足位置，不拉群历史',async()=>{
+  const g=new FeishuGateway({} as any) as any;const get=vi.fn().mockResolvedValue({code:0,data:{items:[{message_id:'om_sent',chat_id:'oc_chat',thread_id:'omt_thread',thread_message_position:'9'}]}});g.client={im:{message:{get}}};const link=await g.resolveIssueTopicLink({messageId:'om_sent',chatId:'oc_chat'});expect(new URL(link).searchParams.get('thread_position')).toBe('9');expect(get).toHaveBeenCalledWith({path:{message_id:'om_sent'}});
+ });
+ it('单聊富文本包含定位消息、PR 与测试页面链接',async()=>{
+  const g=new FeishuGateway({} as any) as any;const create=vi.fn().mockResolvedValue({code:0,data:{message_id:'om_dm'}});g.client={im:{message:{create}}};const link='https://applink.feishu.cn/client/thread/open?open_chat_id=oc_chat&open_thread_id=omt_thread&thread_position=12';
+  await g.sendIssueDirectNotice({recipient:'ou_user',message:'PR：https://github.com/blackpill/usmapgames.com/pull/10\n测试：http://192.168.3.16:8801/',link,uuid:'stable'});const request=create.mock.calls[0][0];expect(request.params.receive_id_type).toBe('open_id');expect(request.data.msg_type).toBe('post');const content=JSON.parse(request.data.content);const links=content.zh_cn.content.flat().filter((x:any)=>x.tag==='a').map((x:any)=>x.href);expect(links).toContain(link);expect(links).toContain('http://192.168.3.16:8801/');expect(request.data.uuid).toBe('stable');
+ });
 });

@@ -75,3 +75,14 @@ describe('CodexClient rich input', () => {
     expect(client.request).toHaveBeenCalledWith('app/list', expect.objectContaining({ threadId: undefined }));
   });
 });
+
+it('blocks external turns and steering on a managed Issue session while allowing Supervisor',async()=>{
+ const client=new CodexClient() as any;
+ client.setIssueSessionGuard((id:string)=>id==='managed');
+ client.readThread=vi.fn().mockResolvedValue({cwd:'/tmp',turns:[{id:'turn',status:'inProgress'}]});
+ client.request=vi.fn().mockResolvedValue({turn:{id:'turn'}});
+ await expect(client.send('managed','external')).rejects.toThrow('Issue');
+ await expect(client.steer('managed','external')).rejects.toThrow('Issue');
+ await expect(client.sendManaged('managed','internal')).resolves.toEqual({turn:{id:'turn'}});
+ await expect(client.send('other','external')).resolves.toEqual({turn:{id:'turn'}});
+});
