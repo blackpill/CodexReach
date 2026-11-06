@@ -200,3 +200,9 @@ Topic 和单聊分别保存 SQLite 回执；单聊失败时不重复发送已确
 ## Hermes 项目运营桥
 
 Linux Hermes 的 Issue 草稿、飞书常驻台账和Mac只读执行快照接入见 [运营桥说明](docs/implement/hermes-project-bridge.md)。`npm run test:all` 新增标准库 Python 3.10+ 的运营桥测试，不读取生产凭据；本地/CI需要python3。多仓库Runner仍须人工审核合并和维护窗口部署，不自动合并或发布站点。
+
+## YouTube 视频与频道评论监控
+
+官方 API 在北京时间每天 07:00–22:00（含 22 点）每小时整点检查指定视频或频道全部视频的新增顶层评论，推送到指定飞书群。首次成功运行只建立静默基线，不推送历史评论；SQLite 保存去重、扫描水位和失败重试队列。默认关闭。
+
+配置 `YOUTUBE_MONITOR_ENABLED`、`YOUTUBE_API_KEY`、`YOUTUBE_VIDEO_IDS` / `YOUTUBE_CHANNEL_IDS`、`YOUTUBE_FEISHU_CHAT_ID`，详见 [配置、独立进程与运维说明](docs/implement/youtube-comment-monitor.md)。频道模式自动分页读取上传列表、纳入新视频，并保留旧视频基线。监控不需要 OAuth，不自动回复，也不会执行评论中的指令。API 请求尝试按太平洋配额日持久化统计，达到配置额度的 70% / 90% 时各向专用群提醒一次（本监控本地估算，不含启用前及其他程序消耗）。

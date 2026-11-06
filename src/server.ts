@@ -20,6 +20,7 @@ import { IssueStore } from './issue-auto/store.js';
 import { readIssueConfig } from './issue-auto/config.js';
 import { createIssueAutomation } from './issue-auto/boot.js';
 import { BaseSyncService, LarkEvaluationBaseApi } from './evaluation/base-sync.js';
+import { createYouTubeAutomation } from './youtube-monitor/boot.js';
 
 try { process.loadEnvFile(); } catch { /* .env 可选 */ }
 
@@ -256,6 +257,16 @@ function localIp() { return Object.values(os.networkInterfaces()).flat().find((i
 const host = process.env.HOST ?? '0.0.0.0', port = Number(process.env.PORT ?? 4317);
 const feishuReady = feishu.start();
 evaluationScheduler.start();
+let youtubeAutomation: ReturnType<typeof createYouTubeAutomation>;
+try {
+  youtubeAutomation = createYouTubeAutomation(process.env, {
+    onEvent: (event, data) => logger.info(event, data),
+  });
+  youtubeAutomation?.start();
+} catch {
+  logger.warn('youtube_monitor_disabled_invalid_config');
+}
+app.addHook('onClose', async () => { await youtubeAutomation?.stop(); });
 let issueAutomation: ReturnType<typeof createIssueAutomation> | undefined;
 app.addHook('onClose', async () => { if (issueAutomation) await issueAutomation.stop(); codex.setIssueSessionGuard(); issueGuardStore.close(); });
 await app.listen({ host, port });
