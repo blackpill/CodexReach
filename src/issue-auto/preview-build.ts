@@ -4,6 +4,7 @@ import os from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { privateLanHost } from './preview-manager.js';
+import type { ValidationCommand } from './validator.js';
 const exec = promisify(execFile);
 export function detectLanHost(): string {
   for (const name of Object.keys(os.networkInterfaces())
@@ -21,10 +22,13 @@ export function createPreviewBuilder(config: {
   root: string;
   expectedRemote: string;
   nodeBin: string;
+  install?: ValidationCommand;
+  build?: ValidationCommand;
 }) {
   const requested = path.resolve(config.root);
   fs.mkdirSync(requested, { recursive: true, mode: 0o700 });
-  if (fs.lstatSync(requested).isSymbolicLink()) throw Error('preview root must not be a symlink');
+  if (fs.lstatSync(requested).isSymbolicLink())
+    throw Error('preview root must not be a symlink');
   const root = fs.realpathSync(requested);
   const env: NodeJS.ProcessEnv = {
     HOME: process.env.HOME,
@@ -78,8 +82,13 @@ export function createPreviewBuilder(config: {
       await run(config.projectPath, 'git', ['fetch', '--no-tags', 'origin', sha]);
       await run(config.projectPath, 'git', ['worktree', 'add', '--detach', worktree, sha]);
       await verify(worktree, sha);
-      await run(worktree, 'npm', ['ci', '--no-audit', '--no-fund'], 15 * 60_000);
-      await run(worktree, 'npm', ['run', 'build'], 10 * 60_000);
+      const install = config.install ?? {
+        executable: 'npm',
+        args: ['ci', '--no-audit', '--no-fund'],
+      };
+      const build = config.build ?? { executable: 'npm', args: ['run', 'build'] };
+      await run(worktree, install.executable, install.args, 15 * 60_000);
+      await run(worktree, build.executable, build.args, 10 * 60_000);
       await verify(worktree, sha);
       if (await run(worktree, 'git', ['status', '--porcelain']))
         throw Error('preview build modified committed source');

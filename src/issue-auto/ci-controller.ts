@@ -4,6 +4,7 @@ export async function trackCi(
   store: IssueStore,
   taskId: string,
   github: {
+    repositoryUrl?: string;
     checkCi(prNumber: number, required: string[]): Promise<CiResult>;
     downloadJobLogs?(jobId: number): Promise<string>;
   },
@@ -39,7 +40,7 @@ export async function trackCi(
       progress.version,
       'BLOCKED',
       { ...c, reason: 'ci_timeout' },
-      `CI 等待超时，需要人工处理：https://github.com/blackpill/usmapgames.com/pull/${c.prNumber}`,
+      `CI 等待超时，需要人工处理：${github.repositoryUrl ?? 'https://github.com/blackpill/usmapgames.com'}/pull/${c.prNumber}`,
     );
     return;
   }
@@ -53,7 +54,7 @@ export async function trackCi(
       progress.version,
       'PR_READY',
       context,
-      `PR CI 已通过，请审核：https://github.com/blackpill/usmapgames.com/pull/${c.prNumber}\nIssue：#${store.get(taskId)?.issueNumber ?? '?'} ${String(c.issueTitle ?? '').slice(0, 200)}\n提交：${result.headSha}\n检查：${(c.required as string[]).join(', ')}\n未自动验证的业务条件请人工核对。`,
+      `PR CI 已通过，请审核：${github.repositoryUrl ?? 'https://github.com/blackpill/usmapgames.com'}/pull/${c.prNumber}\nIssue：#${store.get(taskId)?.issueNumber ?? '?'} ${String(c.issueTitle ?? '').slice(0, 200)}\n提交：${result.headSha}\n检查：${(c.required as string[]).join(', ')}\n未自动验证的业务条件请人工核对。`,
     );
   } else if (result.status === 'blocked' && result.reason === 'pr_closed') {
     store.transition(taskId, progress.version, 'PAUSED', { ...context, reason: 'pr_closed' });
@@ -111,7 +112,10 @@ export async function trackCi(
 export async function recheckReady(
   store: IssueStore,
   taskId: string,
-  github: { checkCi(prNumber: number, required: string[]): Promise<CiResult> },
+  github: {
+    repositoryUrl?: string;
+    checkCi(prNumber: number, required: string[]): Promise<CiResult>;
+  },
   now = Date.now(),
 ): Promise<void> {
   const p = store.getProgress(taskId);
@@ -134,6 +138,6 @@ export async function recheckReady(
       p.version,
       'CI_CHECKING',
       { ...c, ciStartedAt: now, ciReason: 'changed_after_notice' },
-      `PR 状态已变化，正在重新检查：https://github.com/blackpill/usmapgames.com/pull/${c.prNumber}`,
+      `PR 状态已变化，正在重新检查：${github.repositoryUrl ?? 'https://github.com/blackpill/usmapgames.com'}/pull/${c.prNumber}`,
     );
 }

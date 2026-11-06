@@ -9,9 +9,10 @@
     "test": "vitest run --config vitest.config.ts",
     "check": "tsc -p tsconfig.json --noEmit",
     "test:worker": "vitest run --config worker/vitest.config.ts",
-    "test:all": "npm test && npm run test:worker",
+    "test:all": "npm test && npm run test:worker && npm run test:hermes",
     "check:worker": "tsc -p worker/tsconfig.json",
-    "check:all": "npm run check && npm run check:worker"
+    "check:all": "npm run check && npm run check:worker",
+    "test:hermes": "python3 -m unittest discover -s integrations/hermes -p \"test_*.py\""
   },
   "dependencies": {
     "@fastify/static": "^10.1.3",

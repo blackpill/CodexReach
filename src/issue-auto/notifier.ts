@@ -4,7 +4,11 @@ import type { CiResult } from './github.js';
 export async function deliverNotices(
   store: IssueStore,
   send: (message: string, taskId: string, version: number) => Promise<void>,
-  github?: { checkCi(prNumber: number, required: string[]): Promise<CiResult> },
+  github?:
+    | { checkCi(prNumber: number, required: string[]): Promise<CiResult> }
+    | ((taskId: string) => {
+        checkCi(prNumber: number, required: string[]): Promise<CiResult>;
+      }),
 ): Promise<void> {
   const failures: unknown[] = [];
   for (const notice of store.pendingNotices()) {
@@ -23,7 +27,8 @@ export async function deliverNotices(
           typeof c.ciHeadSha !== 'string'
         )
           throw new Error('cannot verify ready notice');
-        const result = await github.checkCi(c.prNumber as number, c.required as string[]);
+        const client = typeof github === 'function' ? github(notice.taskId) : github;
+        const result = await client.checkCi(c.prNumber as number, c.required as string[]);
         if (result.status !== 'passed' || result.headSha !== c.ciHeadSha) {
           if (
             store.transition(notice.taskId, progress.version, 'CI_CHECKING', {
@@ -46,12 +51,12 @@ export async function deliverNotices(
 }
 export async function deliverSystemNotices(
   store: IssueStore,
-  send: (message: string, key: string) => Promise<void>,
+  send: (message: string, key: string, repositoryId?: number) => Promise<void>,
 ): Promise<void> {
   const failures: unknown[] = [];
   for (const notice of store.pendingSystemNotices()) {
     try {
-      await send(notice.message, notice.key);
+      await send(notice.message, notice.key, notice.repositoryId);
       store.markSystemNoticeDelivered(notice.key);
     } catch (error) {
       failures.push(error);

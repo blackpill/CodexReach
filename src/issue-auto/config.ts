@@ -2,7 +2,27 @@ import path from 'node:path';
 import { privateLanHost } from './preview-manager.js';
 import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import type { ValidationCommand } from './validator.js';
+export type ProjectConfig = {
+  enabled: boolean;
+  repositoryId: number;
+  owner: string;
+  repo: string;
+  baseBranch: string;
+  projectPath: string;
+  worktreeRoot: string;
+  expectedRemote: string;
+  packageManager: 'npm' | 'pnpm';
+  install: ValidationCommand;
+  validate: ValidationCommand[];
+  build: ValidationCommand;
+  required: string[];
+  ciTimeoutMs: number;
+  webhookId?: number;
+  previewEnabled: boolean;
+};
 export type IssueConfig = {
+  projects?: ProjectConfig[];
   projectPath: string;
   worktreeRoot: string;
   expectedRemote: string;
@@ -78,11 +98,12 @@ export function readIssueConfig(
   if (
     !queueSecret ||
     !githubToken ||
-    !required.length ||
-    new Set(required).size !== required.length ||
-    !Number.isFinite(minutes) ||
-    minutes < 1 ||
-    minutes > 1440
+    (!env.ISSUE_AUTO_PROJECTS_JSON &&
+      (!required.length ||
+        new Set(required).size !== required.length ||
+        !Number.isFinite(minutes) ||
+        minutes < 1 ||
+        minutes > 1440))
   )
     throw new Error('incomplete Issue Auto configuration');
   let dmRecipient: string | undefined;
@@ -97,7 +118,11 @@ export function readIssueConfig(
     ];
     dmRecipient =
       env.ISSUE_AUTO_NOTIFY_OPEN_ID?.trim() || (allowed.length === 1 ? allowed[0] : undefined);
-    if (!dmRecipient || !/^ou_[A-Za-z0-9]+$/.test(dmRecipient) || !allowed.includes(dmRecipient))
+    if (
+      !dmRecipient ||
+      !/^ou_[A-Za-z0-9]+$/.test(dmRecipient) ||
+      !allowed.includes(dmRecipient)
+    )
       throw new Error('direct notification requires one explicitly allowed recipient');
   }
   let preview: IssueConfig['preview'];
@@ -117,7 +142,11 @@ export function readIssueConfig(
       throw new Error('invalid LAN preview limits');
     preview = { host, firstPort, max };
   }
+  const projects = env.ISSUE_AUTO_PROJECTS_JSON
+    ? parseProjects(env.ISSUE_AUTO_PROJECTS_JSON)
+    : undefined;
   return {
+    projects,
     projectPath: '/Users/kenny/Web/usmapgames.com',
     worktreeRoot: path.resolve('.data/issue-worktrees'),
     expectedRemote: 'https://github.com/blackpill/usmapgames.com.git',
@@ -131,4 +160,104 @@ export function readIssueConfig(
     dmRecipient,
     dbPath: path.resolve(env.CODEXREACH_STATE_DB ?? '.data/feishu-state.sqlite'),
   };
+}
+
+const identities: Record<number, string> = {
+  1444221313: 'usmapgames.com',
+  1223017142: 'classgames.net',
+};
+function parseProjects(raw: string): ProjectConfig[] {
+  const entries: unknown = JSON.parse(raw);
+  if (!Array.isArray(entries) || !entries.length || entries.length > 2)
+    throw Error('invalid project list');
+  const ids = new Set<number>(),
+    paths = new Set<string>();
+  return entries.map((value: any) => {
+    if (
+      !value ||
+      typeof value !== 'object' ||
+      !Number.isSafeInteger(value.repositoryId) ||
+      identities[value.repositoryId] !== value.repo ||
+      value.owner !== 'blackpill' ||
+      value.baseBranch !== 'main' ||
+      typeof value.enabled !== 'boolean' ||
+      typeof value.projectPath !== 'string' ||
+      !path.isAbsolute(value.projectPath) ||
+      ids.has(value.repositoryId) ||
+      paths.has(path.resolve(value.projectPath)) ||
+      !['npm', 'pnpm'].includes(value.packageManager) ||
+      ![
+        `https://github.com/blackpill/${value.repo}.git`,
+        `git@github.com:blackpill/${value.repo}.git`,
+      ].includes(value.expectedRemote) ||
+      !Array.isArray(value.required) ||
+      !value.required.length ||
+      value.required.some((x: unknown) => typeof x !== 'string' || !x.trim()) ||
+      new Set(value.required).size !== value.required.length ||
+      !Number.isFinite(value.ciTimeoutMs) ||
+      value.ciTimeoutMs < 60000 ||
+      value.ciTimeoutMs > 86400000 ||
+      (value.webhookId !== undefined &&
+        (!Number.isSafeInteger(value.webhookId) || value.webhookId < 1)) ||
+      (value.previewEnabled !== undefined && typeof value.previewEnabled !== 'boolean')
+    )
+      throw Error('invalid project configuration');
+    if (value.repositoryId === 1223017142 && value.previewEnabled === true)
+      throw Error('classgames preview contract is not available');
+    const command = (c: any): ValidationCommand => {
+      if (
+        !c ||
+        c.executable !== value.packageManager ||
+        !Array.isArray(c.args) ||
+        !c.args.length ||
+        c.args.some((x: unknown) => typeof x !== 'string' || x.includes('\0'))
+      )
+        throw Error('invalid project command');
+      // Local operator configuration, never supplied by Issues or queue payloads. No shell evaluation.
+      return { executable: c.executable, args: [...c.args] };
+    };
+    if (!Array.isArray(value.validate) || !value.validate.length)
+      throw Error('missing validation commands');
+    ids.add(value.repositoryId);
+    paths.add(path.resolve(value.projectPath));
+    return {
+      ...value,
+      projectPath: path.resolve(value.projectPath),
+      worktreeRoot: path.resolve('.data/issue-worktrees', String(value.repositoryId)),
+      install: command(value.install),
+      validate: value.validate.map(command),
+      build: command(value.build),
+      previewEnabled: value.repositoryId === 1444221313 && value.previewEnabled === true,
+    };
+  });
+}
+/** Old environment variables continue to describe the original usmap pilot. */
+export function configuredProjects(config: IssueConfig): ProjectConfig[] {
+  return (
+    config.projects ?? [
+      {
+        enabled: true,
+        repositoryId: 1444221313,
+        owner: 'blackpill',
+        repo: 'usmapgames.com',
+        baseBranch: 'main',
+        projectPath: config.projectPath,
+        worktreeRoot: config.worktreeRoot,
+        expectedRemote: config.expectedRemote,
+        packageManager: 'npm',
+        install: { executable: 'npm', args: ['ci', '--no-audit', '--no-fund'] },
+        validate: [{ executable: 'npm', args: ['run', 'verify'] }],
+        build: { executable: 'npm', args: ['run', 'build'] },
+        required: config.required,
+        ciTimeoutMs: config.ciTimeoutMs,
+        webhookId: config.webhookId,
+        previewEnabled: !!config.preview,
+      },
+    ]
+  );
+}
+export function projectUrl(project: { owner: string; repo: string }): string {
+  if (project.owner !== 'blackpill' || !Object.values(identities).includes(project.repo))
+    throw Error('untrusted repository identity');
+  return `https://github.com/${project.owner}/${project.repo}`;
 }

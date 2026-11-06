@@ -12,7 +12,9 @@ export async function verifyWebhook(
     false,
     ['verify'],
   );
-  const bytes = Uint8Array.from(signature.slice(7).match(/../g)!, (part) => parseInt(part, 16));
+  const bytes = Uint8Array.from(signature.slice(7).match(/../g)!, (part) =>
+    parseInt(part, 16),
+  );
   return crypto.subtle.verify('HMAC', key, bytes, Uint8Array.from(body));
 }
 
@@ -25,13 +27,15 @@ export type IssueTrigger = {
 export function parseIssueEvent(
   eventType: string,
   payload: unknown,
-  repositoryId: number,
+  repositoryId: number | number[],
   actorId: number,
 ): IssueTrigger | null {
   if (eventType !== 'issues' || !payload || typeof payload !== 'object') return null;
   const value = payload as Record<string, any>;
   if (
-    value.repository?.id !== repositoryId ||
+    !(Array.isArray(repositoryId) ? repositoryId : [repositoryId]).includes(
+      value.repository?.id,
+    ) ||
     value.sender?.id !== actorId ||
     !Number.isSafeInteger(value.issue?.number) ||
     value.issue.number < 1 ||
@@ -39,12 +43,22 @@ export function parseIssueEvent(
   )
     return null;
   if (value.action === 'labeled' && value.label?.name === 'Auto')
-    return { repositoryId, issueNumber: value.issue.number, actorId, action: 'labeled' };
+    return {
+      repositoryId: value.repository.id,
+      issueNumber: value.issue.number,
+      actorId,
+      action: 'labeled',
+    };
   if (
     value.action === 'opened' &&
     Array.isArray(value.issue.labels) &&
     value.issue.labels.some((label: any) => label?.name === 'Auto')
   )
-    return { repositoryId, issueNumber: value.issue.number, actorId, action: 'opened' };
+    return {
+      repositoryId: value.repository.id,
+      issueNumber: value.issue.number,
+      actorId,
+      action: 'opened',
+    };
   return null;
 }

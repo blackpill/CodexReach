@@ -4,7 +4,10 @@ type Context = Record<string, unknown>;
 export type CoordinatorOps = {
   eligible(task: IssueTask): Promise<boolean>;
   prepare(task: IssueTask): Promise<Context>;
-  launch(context: Context, failureEvidence: string): Promise<{ threadId: string; turnId: string }>;
+  launch(
+    context: Context,
+    failureEvidence: string,
+  ): Promise<{ threadId: string; turnId: string }>;
   turn(context: Context): Promise<'running' | 'completed' | 'failed'>;
   interrupt?(context: Context): Promise<void>;
   validate(context: Context): Promise<{ passed: boolean; evidence?: string; commit?: string }>;
@@ -70,7 +73,10 @@ export class Coordinator {
     }
     if (p.stage === 'PREPARING' && c.phase === 'preparing') {
       if (
-        !this.store.transition(taskId, p.version, 'PREPARING', { ...c, phase: 'preparing-active' })
+        !this.store.transition(taskId, p.version, 'PREPARING', {
+          ...c,
+          phase: 'preparing-active',
+        })
       )
         return;
       const prepared = await this.ops.prepare(task);
@@ -97,8 +103,12 @@ export class Coordinator {
         block('Issue 已关闭或没有 Auto 标签');
         return;
       }
+      if (!this.store.acquireExecution(taskId)) return;
       const launched = { ...c, phase: 'launching', turnCount: Number(c.turnCount ?? 0) + 1 };
-      if (!this.store.transition(taskId, p.version, p.stage, launched)) return;
+      if (!this.store.transition(taskId, p.version, p.stage, launched)) {
+        this.store.releaseExecution(taskId);
+        return;
+      }
       try {
         const turn = await this.ops.launch(launched, String(c.failedChecks ?? ''));
         if (!turn.threadId || !turn.turnId) throw new Error('missing turn identity');
@@ -124,9 +134,23 @@ export class Coordinator {
     }
     if (p.stage === 'DEVELOPING' && c.phase === 'running') {
       const result = await this.ops.turn(c);
-      if (result === 'completed')
-        this.store.transition(taskId, p.version, 'VALIDATING', { ...c, phase: 'needs-validation' });
-      else if (result === 'failed') block('Codex Turn 失败或中断');
+      if (result === 'completed') {
+        this.store.transition(taskId, p.version, 'VALIDATING', {
+          ...c,
+          phase: 'needs-validation',
+        });
+        this.store.releaseExecution(taskId);
+      } else if (result === 'failed') {
+        // Terminal status has been observed; unlike an uncertain launch this is safe to release.
+        this.store.transition(
+          taskId,
+          p.version,
+          'BLOCKED',
+          { ...c, phase: 'turn-stopped', reason: 'turn_failed' },
+          `Issue #${task.issueNumber} 需要人工处理：Codex Turn 失败或中断`,
+        );
+        this.store.releaseExecution(taskId);
+      }
       return;
     }
     if (p.stage === 'VALIDATING' && c.phase === 'validation-active') {
@@ -152,7 +176,9 @@ export class Coordinator {
       else {
         const failures = Number(c.validationFailures ?? 0) + 1;
         const noProgress =
-          result.commit && result.commit === c.lastFailedCommit ? Number(c.noProgress ?? 0) + 1 : 0;
+          result.commit && result.commit === c.lastFailedCommit
+            ? Number(c.noProgress ?? 0) + 1
+            : 0;
         const reason =
           noProgress >= 2
             ? '连续两轮无可验证进展'
@@ -188,11 +214,14 @@ export class Coordinator {
         block('CI 检查或超时时限未配置');
         return;
       }
-      if (!this.store.transition(taskId, p.version, 'CREATING_PR', { ...c, phase: 'publishing' }))
+      if (
+        !this.store.transition(taskId, p.version, 'CREATING_PR', { ...c, phase: 'publishing' })
+      )
         return;
       try {
         const pr = await this.ops.publish(c);
-        if (!Number.isSafeInteger(pr.prNumber) || pr.prNumber < 1) throw new Error('invalid PR');
+        if (!Number.isSafeInteger(pr.prNumber) || pr.prNumber < 1)
+          throw new Error('invalid PR');
         this.store.transition(taskId, p.version + 1, 'CI_CHECKING', {
           ...c,
           ...pr,

@@ -9,9 +9,22 @@ type Env = {
   DB: { prepare(sql: string): Statement; batch(statements: Statement[]): Promise<unknown> };
   WEBHOOK_SECRET: string;
   RUNNER_SECRET: string;
-  REPOSITORY_ID: string;
+  REPOSITORY_ID?: string;
+  REPOSITORY_IDS?: string;
   ACTOR_ID: string;
 };
+function repositoryIds(env: Env): number[] {
+  const raw = (env.REPOSITORY_IDS ?? env.REPOSITORY_ID ?? '').split(',');
+  const ids = raw.map((x) => Number(x.trim()));
+  if (
+    !ids.length ||
+    ids.length > 10 ||
+    ids.some((x) => !Number.isSafeInteger(x) || x < 1) ||
+    new Set(ids).size !== ids.length
+  )
+    throw Error('invalid repository allowlist');
+  return ids;
+}
 const json = (value: unknown, status = 200) =>
   Response.json(value, { status, headers: { 'cache-control': 'no-store' } });
 const MAX_BODY = 256 * 1024;
@@ -52,13 +65,23 @@ async function readBytes(request: Request): Promise<Uint8Array | null> {
   return out;
 }
 export async function handle(request: Request, env: Env): Promise<Response> {
+  let allowed: number[];
+  try {
+    allowed = repositoryIds(env);
+  } catch {
+    return json({ error: 'invalid repository configuration' }, 503);
+  }
   if (request.method !== 'POST') return json({ error: 'not found' }, 404);
   const route = new URL(request.url).pathname;
   if (route === '/webhook') {
     const body = await readBytes(request);
     if (!body) return json({ error: 'too large' }, 413);
     if (
-      !(await verifyWebhook(body, request.headers.get('x-hub-signature-256'), env.WEBHOOK_SECRET))
+      !(await verifyWebhook(
+        body,
+        request.headers.get('x-hub-signature-256'),
+        env.WEBHOOK_SECRET,
+      ))
     )
       return json({ error: 'unauthorized' }, 401);
     const event = request.headers.get('x-github-event');
@@ -72,12 +95,7 @@ export async function handle(request: Request, env: Env): Promise<Response> {
     } catch {
       return json({ error: 'invalid json' }, 400);
     }
-    const trigger = parseIssueEvent(
-      event ?? '',
-      payload,
-      Number(env.REPOSITORY_ID),
-      Number(env.ACTOR_ID),
-    );
+    const trigger = parseIssueEvent(event ?? '', payload, allowed, Number(env.ACTOR_ID));
     if (!trigger) return json({ ignored: true });
     const now = Date.now();
     await env.DB.batch([
@@ -113,11 +131,23 @@ export async function handle(request: Request, env: Env): Promise<Response> {
   if (route === '/claim') {
     if (typeof data?.runnerId !== 'string' || !/^[a-zA-Z0-9_-]{1,100}$/.test(data.runnerId))
       return json({ error: 'invalid runner' }, 400);
+    // Legacy callers are restricted to the original single repository, not the full new list.
+    const requested = data.repositoryIds ?? [Number(env.REPOSITORY_ID)];
+    if (
+      !Array.isArray(requested) ||
+      !requested.length ||
+      requested.length > 10 ||
+      requested.some(
+        (id: unknown) => !Number.isSafeInteger(id) || !allowed.includes(id as number),
+      ) ||
+      new Set(requested).size !== requested.length
+    )
+      return json({ error: 'invalid repositories' }, 400);
     const token = crypto.randomUUID();
     const row = await env.DB.prepare(
-      `UPDATE tasks SET status='leased', lease_token=?, lease_version=lease_version+1, lease_until=?, runner_id=? WHERE id=(SELECT id FROM tasks WHERE status='pending' OR (status='leased' AND lease_until < ?) ORDER BY created_at, id LIMIT 1) RETURNING id,repository_id,issue_number,actor_id,action,lease_version`,
+      `UPDATE tasks SET status='leased', lease_token=?, lease_version=lease_version+1, lease_until=?, runner_id=? WHERE id=(SELECT id FROM tasks WHERE repository_id IN (${requested.map(() => '?').join(',')}) AND (status='pending' OR (status='leased' AND lease_until < ?)) ORDER BY created_at, id LIMIT 1) RETURNING id,repository_id,issue_number,actor_id,action,lease_version`,
     )
-      .bind(token, now + 120_000, data.runnerId, now)
+      .bind(token, now + 120_000, data.runnerId, ...requested, now)
       .first<any>();
     if (!row) return new Response(null, { status: 204 });
     return json({
@@ -139,9 +169,16 @@ export async function handle(request: Request, env: Env): Promise<Response> {
   )
     return json({ error: 'invalid ack' }, 400);
   const row = await env.DB.prepare(
-    `UPDATE tasks SET status='delivered' WHERE id=? AND lease_token=? AND lease_version=? AND ((status='leased' AND lease_until>=?) OR status='delivered') RETURNING id`,
+    `UPDATE tasks SET status='delivered' WHERE id=? AND lease_token=? AND lease_version=? AND (? IS NULL OR runner_id=?) AND ((status='leased' AND lease_until>=?) OR status='delivered') RETURNING id`,
   )
-    .bind(data.taskId, data.leaseToken, data.leaseVersion, now)
+    .bind(
+      data.taskId,
+      data.leaseToken,
+      data.leaseVersion,
+      data.runnerId ?? null,
+      data.runnerId ?? null,
+      now,
+    )
     .first();
   return row ? json({ delivered: true }) : json({ error: 'stale lease' }, 409);
 }

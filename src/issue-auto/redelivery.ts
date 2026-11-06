@@ -22,6 +22,7 @@ export class WebhookRedelivery {
     private store: IssueStore,
     private client: Client,
     private hookId: number,
+    private repositoryId?: number,
   ) {
     if (!Number.isSafeInteger(hookId) || hookId < 1) throw new Error('invalid webhook id');
   }
@@ -35,6 +36,7 @@ export class WebhookRedelivery {
         this.store.addSystemNotice(
           `webhook-monitor:${this.hookId}:${Math.floor(now / 86400000)}`,
           'GitHub Webhook 投递检查失败，无法确认失败事件是否已重投，请检查 GitHub 权限和网络。',
+          this.repositoryId,
         );
       throw error;
     }
@@ -45,6 +47,7 @@ export class WebhookRedelivery {
       this.store.addSystemNotice(
         `webhook-gap:${this.hookId}:${prior}`,
         'Webhook 投递检查中断超过 3 天，部分历史投递可能已无法重投，请人工核对 GitHub 事件。',
+        this.repositoryId,
       );
     const groups = new Map<string, WebhookDelivery[]>();
     let complete = false;
@@ -97,6 +100,7 @@ export class WebhookRedelivery {
         this.store.addSystemNotice(
           `webhook-failed:${this.hookId}:${guid}`,
           `GitHub Webhook 投递连续重试 ${MAX_ATTEMPTS} 次仍未成功，请人工检查投递记录。`,
+          this.repositoryId,
         );
         continue;
       }

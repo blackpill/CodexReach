@@ -2,7 +2,7 @@
 
 ## 范围与安全边界
 
-当前实现仅支持 `blackpill/usmapgames.com`、仓库 ID `1444221313` 和可信 GitHub 用户 `blackpill`（ID `1231245`）。Worker 与 Mac 两端都有限制；不是任意仓库的通用 Runner。新建带 `Auto` 的 Issue 或可信人员添加 `Auto` 标签时启动，同一 Issue 不会因移除并重新加标签重复执行。
+默认兼容原 `blackpill/usmapgames.com`（仓库 ID `1444221313`）配置；可显式声明 `blackpill/classgames.net`（ID `1223017142`），接入前必须补齐其远端 PR CI，详见 [多项目配置](issue-auto-multi-project.md)。可信 GitHub 用户仍只允许 `blackpill`（ID `1231245`）。Worker 与 Mac 两端都有限制；不是任意仓库的通用 Runner。新建带 `Auto` 的 Issue 或可信人员添加 `Auto` 标签时启动，同一 Issue 不会因移除并重新加标签重复执行。
 
 默认关闭。开启前必须明确接受本机 `dangerFullAccess` 风险；独立 worktree 不等于安全沙箱，模型、项目脚本和依赖可访问本机文件与网络。自动流程不合并 PR、不部署生产站点、不关闭 Issue。敏感文件名检查只是额外防线，不是完整 secret 扫描；PR 仍需人工审核。
 
