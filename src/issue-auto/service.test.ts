@@ -28,7 +28,14 @@ it('waits for an active tick before allowing shutdown', async () => {
         }),
     ),
   };
-  const service = new IssueService(store, queue, { step: vi.fn() }, vi.fn(), vi.fn(), () => {});
+  const service = new IssueService(
+    store,
+    queue,
+    { step: vi.fn() },
+    vi.fn(),
+    vi.fn(),
+    () => {},
+  );
   service.start();
   let stopped = false;
   const stopping = service.stop().then(() => {
@@ -155,4 +162,45 @@ it('checks webhook delivery history at most every five minutes without blocking 
   expect(scan).toHaveBeenCalledTimes(2);
   store.close();
   vi.useRealTimers();
+});
+it('reconciles handoff controls before any automatic side effects', async () => {
+  const store = new IssueStore(':memory:');
+  store.importTask({
+    taskId: 't',
+    repositoryId: 1,
+    issueNumber: 1,
+    actorId: 1,
+    action: 'opened',
+  });
+  store.reserveSession('s', 't');
+  store.transition('t', 0, 'DEVELOPING', { phase: 'repair-ready' });
+  const { HandoffStore } = await import('./handoff-store.js');
+  const h = new HandoffStore(store);
+  h.request('s', 'ou_one');
+  const order: string[] = [];
+  const coordinator = {
+    step: vi.fn(async () => {
+      order.push('auto');
+    }),
+  };
+  const controls = vi.fn(async () => {
+    order.push('control');
+    h.enterManual('t');
+  });
+  const service = new IssueService(
+    store,
+    { poll: vi.fn().mockResolvedValue(undefined) },
+    coordinator,
+    vi.fn(),
+    vi.fn(),
+    () => {},
+    10000,
+    undefined,
+    undefined,
+    controls,
+  );
+  await service.runOnce();
+  expect(order).toEqual(['control']);
+  expect(coordinator.step).not.toHaveBeenCalled();
+  store.close();
 });

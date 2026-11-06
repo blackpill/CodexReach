@@ -59,7 +59,10 @@ export class GitHubClient {
   async listWebhookDeliveries(
     hookId: number,
     cursor?: string,
-  ): Promise<{ items: import('./redelivery.js').WebhookDelivery[]; nextCursor?: string }> {
+  ): Promise<{
+    items: import('./redelivery.js').WebhookDelivery[];
+    nextCursor?: string;
+  }> {
     if (
       !Number.isSafeInteger(hookId) ||
       hookId < 1 ||
@@ -79,7 +82,8 @@ export class GitHubClient {
       redirect: 'error',
       signal: AbortSignal.timeout(15000),
     });
-    if (!response.ok) throw new Error(`GitHub webhook history failed: ${response.status}`);
+    if (!response.ok)
+      throw new Error(`GitHub webhook history failed: ${response.status}`);
     const raw = await response.text();
     const items = JSON.parse(raw.replace(/(?<!\\)(\"id\"\s*:\s*)(\d+)/g, '$1\"$2\"'));
     if (!Array.isArray(items)) throw new Error('invalid webhook history');
@@ -91,7 +95,8 @@ export class GitHubClient {
       if (next.origin !== 'https://api.github.com' || next.pathname !== endpoint)
         throw new Error('untrusted webhook pagination link');
       nextCursor = next.searchParams.get('cursor') ?? undefined;
-      if (!nextCursor || nextCursor.length > 500) throw new Error('invalid webhook cursor');
+      if (!nextCursor || nextCursor.length > 500)
+        throw new Error('invalid webhook cursor');
     }
     return { items, nextCursor };
   }
@@ -186,17 +191,36 @@ export class GitHubClient {
     return text.replace(/\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{20,}\b/g, '[REDACTED]');
   }
   async ensurePr(input: {
+    existingPr?: number;
     branch: string;
     title: string;
     body: string;
   }): Promise<{ number: number; url: string }> {
     if (!/^codex\/issue-[1-9][0-9]*-[a-zA-Z0-9-]{1,64}$/.test(input.branch))
       throw new Error('invalid branch');
+    // Updating a known PR is never allowed to fall back to creating another one.
+    if (input.existingPr !== undefined) {
+      if (!Number.isSafeInteger(input.existingPr) || input.existingPr < 1)
+        throw Error('invalid existing PR');
+      const pr = await this.get(`${this.REPO}/pulls/${input.existingPr}`);
+      if (
+        pr.state !== 'open' ||
+        pr.number !== input.existingPr ||
+        pr.head?.ref !== input.branch ||
+        pr.base?.ref !== this.project.baseBranch ||
+        pr.head?.repo?.id !== this.project.repositoryId ||
+        pr.base?.repo?.id !== this.project.repositoryId ||
+        pr.html_url !== `${this.webUrl}/pull/${input.existingPr}`
+      )
+        throw Error('original PR closed or identity changed; no replacement PR');
+      return { number: input.existingPr, url: pr.html_url as string };
+    }
     const find = async () => {
       const list = await this.get(
         `${this.REPO}/pulls?state=open&head=${encodeURIComponent(`${this.project.owner}:${input.branch}`)}&base=${this.project.baseBranch}&per_page=100`,
       );
-      if (!Array.isArray(list) || list.length > 1) throw new Error('ambiguous pull requests');
+      if (!Array.isArray(list) || list.length > 1)
+        throw new Error('ambiguous pull requests');
       if (!list.length) return undefined;
       const pr = list[0];
       if (
@@ -374,7 +398,11 @@ export class GitHubClient {
           'startup_failure',
         ].includes(matches[0])
       )
-        return finish({ status: 'blocked', headSha: sha, reason: `inconclusive:${name}` });
+        return finish({
+          status: 'blocked',
+          headSha: sha,
+          reason: `inconclusive:${name}`,
+        });
       if (matches[0] !== 'success')
         outcome = { status: 'pending', headSha: sha, reason: `pending:${name}` };
     }

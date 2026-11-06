@@ -29,7 +29,9 @@ describe('PR CI safety', () => {
       [checks]: [
         {
           total_count: 1,
-          check_runs: [{ id: 1, name: 'verify', status: 'completed', conclusion: 'success' }],
+          check_runs: [
+            { id: 1, name: 'verify', status: 'completed', conclusion: 'success' },
+          ],
         },
       ],
       [statuses]: [[]],
@@ -147,7 +149,9 @@ it('downloads full job logs without forwarding credentials to the signed URL', a
     if (String(url).startsWith('https://api.github.com'))
       return new Response(null, {
         status: 302,
-        headers: { location: 'https://results.actions.githubusercontent.com/log?sig=private' },
+        headers: {
+          location: 'https://results.actions.githubusercontent.com/log?sig=private',
+        },
       });
     return new Response('complete line one\ncomplete line two');
   };
@@ -159,7 +163,10 @@ it('rejects redirects to untrusted domains before requesting them', async () => 
   const fetcher = vi
     .fn()
     .mockResolvedValue(
-      new Response(null, { status: 302, headers: { location: 'https://attacker.invalid/a' } }),
+      new Response(null, {
+        status: 302,
+        headers: { location: 'https://attacker.invalid/a' },
+      }),
     );
   await expect(github('secret', fetcher as any).downloadJobLogs(42)).rejects.toThrow();
   expect(fetcher).toHaveBeenCalledTimes(1);
@@ -176,7 +183,8 @@ it('binds failed logs only to a GitHub Actions job in the expected repository', 
             name: 'verify',
             status: 'completed',
             conclusion: 'failure',
-            details_url: 'https://github.com/blackpill/usmapgames.com/actions/runs/123/job/42',
+            details_url:
+              'https://github.com/blackpill/usmapgames.com/actions/runs/123/job/42',
           },
         ],
       },
@@ -202,7 +210,10 @@ it('paginates webhook deliveries using GitHub cursor links and rejects foreign n
       }),
     );
   const client = github('token', fetcher as any);
-  expect(await client.listWebhookDeliveries(10)).toEqual({ items: [], nextCursor: 'abc' });
+  expect(await client.listWebhookDeliveries(10)).toEqual({
+    items: [],
+    nextCursor: 'abc',
+  });
   await expect(client.listWebhookDeliveries(10, 'abc')).rejects.toThrow('untrusted');
   expect(String(fetcher.mock.calls[1][0])).toContain('cursor=abc');
 });
@@ -254,4 +265,46 @@ it('never acts on failed or skipped checks after the PR head changes', async () 
     );
     expect((await client.checkCi(7, ['verify'])).status).toBe('pending');
   }
+});
+it('never creates a replacement when a pinned PR closes during publishing', async () => {
+  const fetcher = vi.fn(async (_url: unknown) =>
+    Response.json({
+      number: 7,
+      state: 'closed',
+      head: { ref: 'codex/issue-1-task' },
+      base: { ref: 'main' },
+      html_url: 'https://github.com/blackpill/usmapgames.com/pull/7',
+    }),
+  );
+  await expect(
+    github('test', fetcher).ensurePr({
+      existingPr: 7,
+      branch: 'codex/issue-1-task',
+      title: 'fix',
+      body: 'body',
+    } as any),
+  ).rejects.toThrow();
+  expect(fetcher).toHaveBeenCalledTimes(1);
+  expect(String(fetcher.mock.calls[0]?.[0])).toContain('/pulls/7');
+});
+
+it('updates only the pinned open PR with matching repository and branch identity', async () => {
+  const fetcher = vi.fn(async (_url: unknown) =>
+    Response.json({
+      number: 7,
+      state: 'open',
+      head: { ref: 'codex/issue-1-task', repo: { id: 1444221313 } },
+      base: { ref: 'main', repo: { id: 1444221313 } },
+      html_url: 'https://github.com/blackpill/usmapgames.com/pull/7',
+    }),
+  );
+  expect(
+    await github('test', fetcher).ensurePr({
+      existingPr: 7,
+      branch: 'codex/issue-1-task',
+      title: 'fix',
+      body: 'body',
+    }),
+  ).toEqual({ number: 7, url: 'https://github.com/blackpill/usmapgames.com/pull/7' });
+  expect(fetcher).toHaveBeenCalledTimes(1);
 });

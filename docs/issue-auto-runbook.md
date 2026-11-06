@@ -30,7 +30,7 @@
 - 每个预览保存 SHA 元数据，响应 noindex/no-store；已知过期状态返回 503，成功通知前再查 GitHub head。PR 关闭后在后续复核回收。依赖与构建产物占磁盘，及时关闭不需要的 PR。
 - `ISSUE_AUTO_DM_NOTIFY_ENABLED=true`：关键事件 Topic 留档并单聊。接收人必须在允许名单中且唯一；不会广播。单聊定位的是本条 Topic 通知的位置，不是永远动态跳到末尾。普通进度仅更新卡片。
 - Topic/单聊回执分别持久化。失败保留 outbox，其他通知仍能继续；跨平台响应丢失时仍不能绝对保证恰好一次。
-- 受管 Session 拒绝手工发送、steer 与修改性控制，避免并发。不能限制 Codex Desktop 或其他工具直接操作。停止按钮只针对运行中的 Codex Turn，不会中止独立验证或远端 CI。
+- 受管 Session 拒绝普通直接发送、steer 与修改性控制，避免并发。原 Topic 可通过“人工接管”或 `/takeover` 安全进入人工模式，串行处理验收意见，再用“继续自动修改”或 `/auto` 交回自动闭环；权限与恢复细节见 [人工接管说明](implement/issue-topic-handoff.md)。不能限制 Codex Desktop 或其他工具直接操作。停止按钮只针对运行中的 Codex Turn，不会中止独立验证或远端 CI。
 
 ## 故障和恢复
 

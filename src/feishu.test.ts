@@ -357,3 +357,15 @@ describe('正式关键通知的单聊与定位',()=>{
   await g.sendIssueDirectNotice({recipient:'ou_user',message:'PR：https://github.com/blackpill/usmapgames.com/pull/10\n测试：http://192.168.3.16:8801/',link,uuid:'stable'});const request=create.mock.calls[0][0];expect(request.params.receive_id_type).toBe('open_id');expect(request.data.msg_type).toBe('post');const content=JSON.parse(request.data.content);const links=content.zh_cn.content.flat().filter((x:any)=>x.tag==='a').map((x:any)=>x.href);expect(links).toContain(link);expect(links).toContain('http://192.168.3.16:8801/');expect(request.data.uuid).toBe('stable');
  });
 });
+describe('Issue 人工控制入口',()=>{
+ it('在原话题将普通意见和接管命令交给受管控制器，不走普通 enqueue',async()=>{
+  const g=new FeishuGateway({assertExternalControlAllowed:()=>{throw Error('guard')}} as any) as any;const control=vi.fn().mockResolvedValue('意见已保存');g.setIssueControlHandler(control);
+  expect(await g.routeIssueInput('session','修改按钮颜色','ou_one','msg1')).toBe('意见已保存');expect(control).toHaveBeenCalledWith({sessionId:'session',actor:'ou_one',action:'feedback',text:'修改按钮颜色',messageId:'msg1'});
+  await g.handleSessionControl('session','/takeover',{chatId:'chat',openId:'ou_one'});expect(control).toHaveBeenLastCalledWith(expect.objectContaining({action:'takeover'}));
+  await g.handleSessionControl('session','/auto 补充测试',{chatId:'chat',openId:'ou_one'});expect(control).toHaveBeenLastCalledWith(expect.objectContaining({action:'resume',text:'补充测试'}));
+ });
+ it('人工模式展示继续自动按钮，等待接管时不允许冒充已解锁',async()=>{
+  const g=new FeishuGateway({} as any) as any;g.tasks.set('s',{startedAt:Date.now(),lastActivityAt:Date.now(),status:'running',managedIssue:true,issueStage:'MANUAL',detail:'人工模式'});let card=await g.taskCard('s');let actions=card.elements.find((x:any)=>x.tag==='action').actions.map((x:any)=>x.value.action);expect(actions).toContain('issue_resume_auto');expect(actions).not.toContain('task_retry');
+  g.tasks.get('s').issueStage='HANDOFF_PENDING';card=await g.taskCard('s');actions=card.elements.find((x:any)=>x.tag==='action').actions.map((x:any)=>x.value.action);expect(actions).not.toContain('issue_resume_auto');
+ });
+});

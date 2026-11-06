@@ -22,7 +22,9 @@ type GitHub = {
   issueEligible(n: number): Promise<boolean>;
   issueDetails(n: number): Promise<{ title: string; body: string }>;
   defaultBranchSha(): Promise<string>;
+  pullState?(pr: number): Promise<'open' | 'closed'>;
   ensurePr(i: {
+    existingPr?: number;
     branch: string;
     title: string;
     body: string;
@@ -42,7 +44,12 @@ type Feishu = {
 };
 type IO = {
   reserveSession?(sessionId: string, taskId: string): void;
-  fetchBase(project: string, sha: string, remote: string, baseBranch?: string): Promise<void>;
+  fetchBase(
+    project: string,
+    sha: string,
+    remote: string,
+    baseBranch?: string,
+  ): Promise<void>;
   prepareWorkspace(i: {
     projectPath: string;
     worktreeRoot: string;
@@ -95,7 +102,12 @@ export function createRuntimeOps(
         throw Error('task repository mismatch');
       const issue = await gh.issueDetails(t.issueNumber),
         sha = await gh.defaultBranchSha();
-      await io.fetchBase(config.projectPath, sha, config.expectedRemote, config.baseBranch);
+      await io.fetchBase(
+        config.projectPath,
+        sha,
+        config.expectedRemote,
+        config.baseBranch,
+      );
       const workspace = await io.prepareWorkspace({
         projectPath: config.projectPath,
         worktreeRoot: config.worktreeRoot,
@@ -103,7 +115,8 @@ export function createRuntimeOps(
         taskId: t.taskId,
         baseSha: sha,
       });
-      if (config.install) await io.install(workspace.worktreePath, nodeBin, config.install);
+      if (config.install)
+        await io.install(workspace.worktreePath, nodeBin, config.install);
       else await io.install(workspace.worktreePath, nodeBin);
       return {
         ...workspace,
@@ -203,11 +216,26 @@ export function createRuntimeOps(
       const n = c.issueNumber;
       if (!Number.isSafeInteger(n) || !(await gh.issueEligible(n as number)))
         throw new Error('issue no longer eligible');
+      if (
+        c.prNumber !== undefined &&
+        (!Number.isSafeInteger(c.prNumber) ||
+          (c.prNumber as number) < 1 ||
+          !gh.pullState ||
+          (await gh.pullState(c.prNumber as number)) !== 'open')
+      )
+        throw Error('原 PR 已关闭、合并或无法核实；不会创建替代 PR，请新建后续 Issue');
       const cwd = requiredString(c, 'worktreePath'),
         branch = requiredString(c, 'branch'),
         commit = requiredString(c, 'commit');
-      await io.push(cwd, branch, commit, config.expectedRemote, requiredString(c, 'baseSha'));
+      await io.push(
+        cwd,
+        branch,
+        commit,
+        config.expectedRemote,
+        requiredString(c, 'baseSha'),
+      );
       const pr = await gh.ensurePr({
+        ...(c.prNumber === undefined ? {} : { existingPr: c.prNumber as number }),
         branch,
         title: `Issue #${n}: ${requiredString(c, 'issueTitle')}`.slice(0, 240),
         body: `Issue: ${projectUrl({ owner: config.owner ?? 'blackpill', repo: config.repo ?? 'usmapgames.com' })}/issues/${n}\n\n请审核变更与测试结果。`,

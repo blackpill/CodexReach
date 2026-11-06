@@ -7,23 +7,26 @@ it('uses the original project to bind the worktree session and validates before 
     defaultBranchSha: vi.fn().mockResolvedValue('a'.repeat(40)),
     ensurePr: vi
       .fn()
-      .mockResolvedValue({ number: 7, url: 'https://github.com/blackpill/usmapgames.com/pull/7' }),
+      .mockResolvedValue({
+        number: 7,
+        url: 'https://github.com/blackpill/usmapgames.com/pull/7',
+      }),
   };
   const codex = {
     prepareThread: vi.fn().mockResolvedValue({ id: 'thread' }),
     send: vi.fn().mockResolvedValue({ turn: { id: 'turn' } }),
-    readThread: vi.fn().mockResolvedValue({ turns: [{ id: 'turn', status: 'completed' }] }),
+    readThread: vi
+      .fn()
+      .mockResolvedValue({ turns: [{ id: 'turn', status: 'completed' }] }),
   };
   const feishu = { bindIssueSession: vi.fn().mockResolvedValue('topic') };
   const io = {
     fetchBase: vi.fn(),
-    prepareWorkspace: vi
-      .fn()
-      .mockResolvedValue({
-        worktreePath: '/tree',
-        branch: 'codex/issue-1-t',
-        baseSha: 'a'.repeat(40),
-      }),
+    prepareWorkspace: vi.fn().mockResolvedValue({
+      worktreePath: '/tree',
+      branch: 'codex/issue-1-t',
+      baseSha: 'a'.repeat(40),
+    }),
     install: vi.fn(),
     checkpoint: vi.fn().mockResolvedValue('b'.repeat(40)),
     validateIsolated: vi.fn().mockResolvedValue({ status: 'passed', results: [] }),
@@ -51,7 +54,11 @@ it('uses the original project to bind the worktree session and validates before 
   });
   const ids = await ops.launch(context, '');
   expect(ids).toEqual({ threadId: 'thread', turnId: 'turn' });
-  expect(feishu.bindIssueSession).toHaveBeenCalledWith('/project', 'thread', expect.any(String));
+  expect(feishu.bindIssueSession).toHaveBeenCalledWith(
+    '/project',
+    'thread',
+    expect.any(String),
+  );
   expect((await ops.validate({ ...context, ...ids })).passed).toBe(true);
   await ops.publish({ ...context, ...ids, commit: 'b'.repeat(40) });
   expect(io.push).toHaveBeenCalled();
@@ -118,7 +125,10 @@ it('reserves the session before exposing the topic and starting the turn', async
     feishu,
     io,
   );
-  await ops.launch({ taskId: 'id', worktreePath: '/w', issueTitle: 'Title', issueNumber: 1 }, '');
+  await ops.launch(
+    { taskId: 'id', worktreePath: '/w', issueTitle: 'Title', issueNumber: 1 },
+    '',
+  );
   expect(order).toEqual(['create', 'reserve', 'bind', 'send']);
   expect(codex.send).not.toHaveBeenCalled();
 });
@@ -129,13 +139,11 @@ it('runs pilot installs and checks with the project Node binary ahead of the ser
   } as any;
   const io = {
     fetchBase: vi.fn(),
-    prepareWorkspace: vi
-      .fn()
-      .mockResolvedValue({
-        worktreePath: '/tree',
-        branch: 'codex/issue-1-t',
-        baseSha: 'a'.repeat(40),
-      }),
+    prepareWorkspace: vi.fn().mockResolvedValue({
+      worktreePath: '/tree',
+      branch: 'codex/issue-1-t',
+      baseSha: 'a'.repeat(40),
+    }),
     install: vi.fn(),
     checkpoint: vi.fn().mockResolvedValue('b'.repeat(40)),
     validateIsolated: vi.fn().mockResolvedValue({ status: 'passed', results: [] }),
@@ -165,7 +173,9 @@ it('runs pilot installs and checks with the project Node binary ahead of the ser
   expect(io.install).toHaveBeenCalledWith('/tree', '/opt/node26/bin/node');
   expect(io.validateIsolated).toHaveBeenCalledWith(
     expect.objectContaining({
-      env: expect.objectContaining({ PATH: expect.stringMatching(/^\/opt\/node26\/bin:/) }),
+      env: expect.objectContaining({
+        PATH: expect.stringMatching(/^\/opt\/node26\/bin:/),
+      }),
     }),
   );
 });
@@ -194,6 +204,74 @@ it('progress-card failures cannot turn a started Codex turn into a blocked launc
     {} as any,
   );
   await expect(
-    ops.launch({ taskId: 'id', worktreePath: '/w', issueTitle: 'Title', issueNumber: 1 }, ''),
+    ops.launch(
+      { taskId: 'id', worktreePath: '/w', issueTitle: 'Title', issueNumber: 1 },
+      '',
+    ),
   ).resolves.toEqual({ threadId: 's', turnId: 't' });
+});
+it('refuses to push a previously existing PR that closes after human resume', async () => {
+  const gh = {
+    issueEligible: vi.fn().mockResolvedValue(true),
+    pullState: vi.fn().mockResolvedValue('closed'),
+    ensurePr: vi.fn(),
+  };
+  const io = { push: vi.fn() };
+  const ops = createRuntimeOps(
+    {
+      projectPath: '/p',
+      worktreeRoot: '/w',
+      expectedRemote: 'remote',
+      required: ['verify'],
+      ciTimeoutMs: 60000,
+    },
+    gh as any,
+    {} as any,
+    {} as any,
+    io as any,
+  );
+  await expect(
+    ops.publish({
+      issueNumber: 1,
+      issueTitle: 'title',
+      prNumber: 7,
+      worktreePath: '/tree',
+      branch: 'codex/issue-1-task',
+      commit: 'a'.repeat(40),
+      baseSha: 'b'.repeat(40),
+    }),
+  ).rejects.toThrow('PR');
+  expect(io.push).not.toHaveBeenCalled();
+  expect(gh.ensurePr).not.toHaveBeenCalled();
+});
+it('pins an existing PR identity through publishing instead of allowing a replacement PR', async () => {
+  const gh = {
+    issueEligible: vi.fn().mockResolvedValue(true),
+    pullState: vi.fn().mockResolvedValue('open'),
+    ensurePr: vi.fn().mockResolvedValue({ number: 7 }),
+  };
+  const io = { push: vi.fn() };
+  const ops = createRuntimeOps(
+    {
+      projectPath: '/p',
+      worktreeRoot: '/w',
+      expectedRemote: 'remote',
+      required: ['verify'],
+      ciTimeoutMs: 60000,
+    },
+    gh as any,
+    {} as any,
+    {} as any,
+    io as any,
+  );
+  await ops.publish({
+    issueNumber: 1,
+    issueTitle: 'title',
+    prNumber: 7,
+    worktreePath: '/tree',
+    branch: 'codex/issue-1-task',
+    commit: 'a'.repeat(40),
+    baseSha: 'b'.repeat(40),
+  });
+  expect(gh.ensurePr).toHaveBeenCalledWith(expect.objectContaining({ existingPr: 7 }));
 });

@@ -11,6 +11,10 @@ export type IssueTask = {
 };
 export class IssueStore {
   private db: Database.Database;
+  /** Internal shared connection for atomic control-plane transitions. */
+  get controlDatabase(): Database.Database {
+    return this.db;
+  }
   private progressObserver?: (
     taskId: string,
     stage: Stage,
@@ -30,6 +34,8 @@ export class IssueStore {
     CREATE TABLE IF NOT EXISTS issue_auto_notices (task_id TEXT NOT NULL, version INTEGER NOT NULL, message TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(task_id, version));
     CREATE TABLE IF NOT EXISTS issue_auto_instance (singleton INTEGER PRIMARY KEY CHECK(singleton=1), pid INTEGER NOT NULL, token TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS issue_auto_execution (singleton INTEGER PRIMARY KEY CHECK(singleton=1), task_id TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS issue_auto_controls(task_id TEXT PRIMARY KEY,mode TEXT NOT NULL,owner TEXT NOT NULL,updated_at INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS issue_auto_feedback(id TEXT PRIMARY KEY,task_id TEXT NOT NULL,actor TEXT NOT NULL,text TEXT NOT NULL,kind TEXT NOT NULL,state TEXT NOT NULL,turn_id TEXT,created_at INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS issue_auto_sessions (session_id TEXT PRIMARY KEY, task_id TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS issue_auto_webhook_retry (hook_id INTEGER NOT NULL, guid TEXT NOT NULL, attempts INTEGER NOT NULL, last_attempt INTEGER NOT NULL, PRIMARY KEY(hook_id,guid));
     CREATE TABLE IF NOT EXISTS issue_auto_webhook_monitor (hook_id INTEGER PRIMARY KEY, last_scan INTEGER NOT NULL);
@@ -37,10 +43,14 @@ export class IssueStore {
     CREATE TABLE IF NOT EXISTS issue_auto_webhook_failures (hook_id INTEGER PRIMARY KEY, count INTEGER NOT NULL);`);
     if (
       !(
-        this.db.pragma('table_info(issue_auto_system_notices)') as Array<{ name: string }>
+        this.db.pragma('table_info(issue_auto_system_notices)') as Array<{
+          name: string;
+        }>
       ).some((c) => c.name === 'repository_id')
     )
-      this.db.exec('ALTER TABLE issue_auto_system_notices ADD COLUMN repository_id INTEGER');
+      this.db.exec(
+        'ALTER TABLE issue_auto_system_notices ADD COLUMN repository_id INTEGER',
+      );
   }
   importTask(t: IssueTask): void {
     this.db.transaction(() => {
@@ -88,7 +98,11 @@ export class IssueStore {
       .prepare('SELECT stage, version, context FROM issue_auto_progress WHERE task_id=?')
       .get(taskId) as { stage: Stage; version: number; context: string } | undefined;
     return row
-      ? { stage: row.stage, version: row.version, context: JSON.parse(row.context) }
+      ? {
+          stage: row.stage,
+          version: row.version,
+          context: JSON.parse(row.context),
+        }
       : undefined;
   }
   setProgressObserver(
@@ -112,7 +126,9 @@ export class IssueStore {
       if (!result.changes) return false;
       if (notice)
         this.db
-          .prepare('INSERT INTO issue_auto_notices(task_id,version,message) VALUES (?,?,?)')
+          .prepare(
+            'INSERT INTO issue_auto_notices(task_id,version,message) VALUES (?,?,?)',
+          )
           .run(taskId, version + 1, notice);
       return true;
     })();
@@ -124,7 +140,11 @@ export class IssueStore {
       }
     return changed;
   }
-  pendingNotices(): Array<{ taskId: string; version: number; message: string }> {
+  pendingNotices(): Array<{
+    taskId: string;
+    version: number;
+    message: string;
+  }> {
     return this.db
       .prepare(
         'SELECT task_id AS taskId, version, message FROM issue_auto_notices WHERE delivered=0 ORDER BY rowid',
@@ -149,7 +169,9 @@ export class IssueStore {
     ).count;
   }
   clearWebhookFailure(hookId: number): void {
-    this.db.prepare('DELETE FROM issue_auto_webhook_failures WHERE hook_id=?').run(hookId);
+    this.db
+      .prepare('DELETE FROM issue_auto_webhook_failures WHERE hook_id=?')
+      .run(hookId);
   }
   webhookRetry(
     hookId: number,
@@ -189,7 +211,11 @@ export class IssueStore {
       )
       .run(key, message, repositoryId ?? null);
   }
-  pendingSystemNotices(): Array<{ key: string; message: string; repositoryId?: number }> {
+  pendingSystemNotices(): Array<{
+    key: string;
+    message: string;
+    repositoryId?: number;
+  }> {
     return this.db
       .prepare(
         'SELECT notice_key AS key,message,repository_id AS repositoryId FROM issue_auto_system_notices WHERE delivered=0 ORDER BY rowid',
@@ -204,7 +230,9 @@ export class IssueStore {
   reserveSession(sessionId: string, taskId: string): void {
     if (!sessionId || !this.get(taskId)) throw new Error('invalid session owner');
     this.db
-      .prepare('INSERT OR IGNORE INTO issue_auto_sessions(session_id,task_id) VALUES (?,?)')
+      .prepare(
+        'INSERT OR IGNORE INTO issue_auto_sessions(session_id,task_id) VALUES (?,?)',
+      )
       .run(sessionId, taskId);
     const row = this.db
       .prepare('SELECT task_id FROM issue_auto_sessions WHERE session_id=?')
@@ -252,10 +280,27 @@ export class IssueStore {
         .run(token).changes === 1
     );
   }
+  automaticMode(taskId: string): string {
+    return (
+      (
+        this.db
+          .prepare('SELECT mode FROM issue_auto_controls WHERE task_id=?')
+          .get(taskId) as { mode: string } | undefined
+      )?.mode ?? 'auto'
+    );
+  }
+  canAdvanceAutomatic(taskId: string, stage: string, phase: unknown): boolean {
+    const mode = this.automaticMode(taskId);
+    return (
+      mode === 'auto' ||
+      (mode === 'requested' && stage === 'DEVELOPING' && phase === 'running')
+    );
+  }
   executionOwner(): string | undefined {
     return (
-      this.db.prepare('SELECT task_id FROM issue_auto_execution WHERE singleton=1').get() as
-        { task_id: string } | undefined
+      this.db
+        .prepare('SELECT task_id FROM issue_auto_execution WHERE singleton=1')
+        .get() as { task_id: string } | undefined
     )?.task_id;
   }
   acquireExecution(taskId: string): boolean {
@@ -272,8 +317,18 @@ export class IssueStore {
           if (row.task_id !== taskId && ['running', 'launching'].includes(c.phase))
             return false;
         }
+        if (
+          this.db
+            .prepare(
+              "SELECT 1 FROM issue_auto_feedback WHERE task_id!=? AND state IN ('launching','running','uncertain') LIMIT 1",
+            )
+            .get(taskId)
+        )
+          return false;
         this.db
-          .prepare('INSERT OR IGNORE INTO issue_auto_execution(singleton,task_id) VALUES(1,?)')
+          .prepare(
+            'INSERT OR IGNORE INTO issue_auto_execution(singleton,task_id) VALUES(1,?)',
+          )
           .run(taskId);
         return true;
       })
@@ -286,12 +341,26 @@ export class IssueStore {
   }
   /** Recover legacy execution ownership before selecting an older PR regression. */
   recoverExecution(): void {
-    const rows = (
+    const automatic = (
       this.db.prepare('SELECT task_id,context FROM issue_auto_progress').all() as Array<{
         task_id: string;
         context: string;
       }>
     ).filter((row) => ['running', 'launching'].includes(JSON.parse(row.context).phase));
+    const manual = this.db
+      .prepare(
+        "SELECT DISTINCT task_id FROM issue_auto_feedback WHERE state IN ('launching','running','uncertain')",
+      )
+      .all() as Array<{ task_id: string }>;
+    const rows = [...new Set([...automatic, ...manual].map((row) => row.task_id))].map(
+      (task_id) => ({ task_id }),
+    );
+    if (
+      rows.length === 1 &&
+      this.executionOwner() &&
+      this.executionOwner() !== rows[0].task_id
+    )
+      throw Error('execution owner conflicts with durable running Turn');
     if (rows.length > 1) {
       for (const row of rows)
         this.addSystemNotice(
@@ -301,13 +370,14 @@ export class IssueStore {
         );
       throw Error('multiple uncertain Issue Turns require manual reconciliation');
     }
-    if (rows.length === 1 && !this.executionOwner()) this.acquireExecution(rows[0].task_id);
+    if (rows.length === 1 && !this.executionOwner())
+      this.acquireExecution(rows[0].task_id);
   }
   listReady(): string[] {
     return (
       this.db
         .prepare(
-          "SELECT task_id FROM issue_auto_progress WHERE stage='PR_READY' ORDER BY rowid",
+          "SELECT p.task_id FROM issue_auto_progress p LEFT JOIN issue_auto_controls c ON c.task_id=p.task_id WHERE p.stage='PR_READY' AND (c.mode IS NULL OR c.mode='auto') ORDER BY p.rowid",
         )
         .all() as Array<{ task_id: string }>
     ).map((x) => x.task_id);
@@ -323,7 +393,9 @@ export class IssueStore {
   }
   count(): number {
     return (
-      this.db.prepare('SELECT count(*) AS n FROM issue_auto_tasks').get() as { n: number }
+      this.db.prepare('SELECT count(*) AS n FROM issue_auto_tasks').get() as {
+        n: number;
+      }
     ).n;
   }
   close(): void {

@@ -10,7 +10,9 @@ export type CoordinatorOps = {
   ): Promise<{ threadId: string; turnId: string }>;
   turn(context: Context): Promise<'running' | 'completed' | 'failed'>;
   interrupt?(context: Context): Promise<void>;
-  validate(context: Context): Promise<{ passed: boolean; evidence?: string; commit?: string }>;
+  validate(
+    context: Context,
+  ): Promise<{ passed: boolean; evidence?: string; commit?: string }>;
   publish(context: Context): Promise<{ prNumber: number }>;
   required: string[];
   ciTimeoutMs: number;
@@ -36,6 +38,7 @@ export class Coordinator {
       p = this.store.getProgress(taskId);
     if (!task || !p) return;
     const c = p.context;
+    if (!this.store.canAdvanceAutomatic(taskId, p.stage, c.phase)) return;
     const block = (reason: string) =>
       this.store.transition(
         taskId,
@@ -103,8 +106,16 @@ export class Coordinator {
         block('Issue 已关闭或没有 Auto 标签');
         return;
       }
-      if (!this.store.acquireExecution(taskId)) return;
-      const launched = { ...c, phase: 'launching', turnCount: Number(c.turnCount ?? 0) + 1 };
+      if (
+        !this.store.canAdvanceAutomatic(taskId, p.stage, c.phase) ||
+        !this.store.acquireExecution(taskId)
+      )
+        return;
+      const launched = {
+        ...c,
+        phase: 'launching',
+        turnCount: Number(c.turnCount ?? 0) + 1,
+      };
       if (!this.store.transition(taskId, p.version, p.stage, launched)) {
         this.store.releaseExecution(taskId);
         return;
@@ -128,7 +139,10 @@ export class Coordinator {
       }
       return;
     }
-    if ((p.stage === 'PREPARING' || p.stage === 'DEVELOPING') && c.phase === 'launching') {
+    if (
+      (p.stage === 'PREPARING' || p.stage === 'DEVELOPING') &&
+      c.phase === 'launching'
+    ) {
       block('Codex 启动结果不确定，未重复启动');
       return;
     }
@@ -215,7 +229,10 @@ export class Coordinator {
         return;
       }
       if (
-        !this.store.transition(taskId, p.version, 'CREATING_PR', { ...c, phase: 'publishing' })
+        !this.store.transition(taskId, p.version, 'CREATING_PR', {
+          ...c,
+          phase: 'publishing',
+        })
       )
         return;
       try {

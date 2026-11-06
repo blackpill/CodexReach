@@ -1,4 +1,5 @@
 import * as lark from '@larksuiteoapi/node-sdk';
+import type {IssueControlInput} from './issue-auto/handoff.js';
 import type {TopicReceipt} from './issue-auto/dual-notice.js';
 import {preciseTopicLink,directNoticeContent} from './issue-auto/feishu-notice.js';
 import fs from 'node:fs';
@@ -80,6 +81,7 @@ export class FeishuGateway {
   private handledComments: string[] = [];
   private syncedTurns = new Map<string, string[]>();
   private evaluationHubTopics = new Map<string, SessionTopic>();
+  private issueControlHandler?: (input:IssueControlInput)=>Promise<string|undefined>;
   private evaluationDraftHandler?: EvaluationDraftHandler;
   private evaluationDueHandler?: EvaluationDueHandler;
   private evaluationTasklistGuid?: string;
@@ -101,6 +103,15 @@ export class FeishuGateway {
     this.evaluationDueHandler = handler;
   }
 
+  setIssueControlHandler(handler?: (input:IssueControlInput)=>Promise<string|undefined>) { this.issueControlHandler=handler; }
+  private async routeIssueInput(sessionId:string,text:string,actor:string,messageId?:string):Promise<string|undefined> {
+    if(!this.issueControlHandler)return undefined;
+    const command=text.trim().split(/\s+/)[0];
+    const action=command==='/takeover'?'takeover':command==='/auto'?'resume':command==='/issue-status'?'status':text.startsWith('/')?undefined:'feedback';
+    if(!action)return undefined;
+    return this.issueControlHandler({sessionId,actor,action,text:action==='feedback'?text:action==='resume'?text.trim().slice(command.length).trim():undefined,messageId});
+  }
+
   hasProjectGroup(projectPath: string): boolean { return !!this.client && this.projectGroups.has(projectPath); }
   async recordIssueTurn(sessionId: string, turnId: string): Promise<void> {
     try { this.recordBridgeTurn(sessionId, turnId); } catch (error) { logger.error('issue_turn_correlation_failed', error, { sessionId }); }
@@ -115,10 +126,10 @@ export class FeishuGateway {
       PREPARING: '正在准备工作区。', DEVELOPING: '正在分析或修改代码。',
       VALIDATING: '正在运行独立本地验证。', CREATING_PR: '本地验证通过，正在准备 PR。',
       CI_CHECKING: 'PR 已创建，正在等待 GitHub CI。', PR_READY: '正在复核 CI，审核提醒将单独发送。', PR_NOTIFIED: 'CI 已通过，PR 等待人工审核。',
-      BLOCKED: '任务需要人工处理，请查看话题中的提醒。', WAITING_QUOTA: '额度不足，等待处理。', PAUSED: '任务已暂停。',
+      PROJECT_DISABLED: '项目已停用，未启动新回合；原执行锁与意见保留。', HANDOFF_PENDING: '已申请人工接管，等待安全边界；尚未解锁。', MANUAL: '人工模式：可在本话题发消息修改，不自动提交或推送。', MANUAL_RUNNING: '正在执行人工指令，后续消息会排队。', RESUME_PENDING: '已申请继续自动，等待人工回合和执行槽安全交回。', MANUAL_BLOCKED: '执行结果不确定，保持锁定，请人工核查旧进程。', BLOCKED: '任务需要人工处理，请查看话题中的提醒。', WAITING_QUOTA: '额度不足，等待处理。', PAUSED: '任务已暂停。',
     };
     const prior = this.tasks.get(sessionId);
-    const status: TaskState['status'] = stage === 'PR_NOTIFIED' ? 'completed' : stage === 'BLOCKED' || stage === 'WAITING_QUOTA' ? 'failed' : stage === 'PAUSED' ? 'stopped' : 'running';
+    const status: TaskState['status'] = stage === 'PR_NOTIFIED' ? 'completed' : ['BLOCKED','WAITING_QUOTA','MANUAL_BLOCKED','PROJECT_DISABLED'].includes(stage) ? 'failed' : ['PAUSED','MANUAL'].includes(stage) ? 'stopped' : 'running';
     this.tasks.set(sessionId, { startedAt: prior?.managedIssue ? prior.startedAt : Date.now(), lastActivityAt: Date.now(), turnId: prior?.turnId, managedIssue: true, issueStage: stage, status, detail: labels[stage] ?? `Issue 任务阶段：${stage}`, cardMessageId: this.issueTaskCardIds.get(sessionId) });
     try { await this.ensureIssueProgressCard(sessionId); } catch (error) { logger.error('issue_progress_card_failed', error, { sessionId }); }
   }
@@ -140,14 +151,14 @@ export class FeishuGateway {
 
   private async handleTaskStatusNotification(threadId: string, notification: any): Promise<void> {
     const state = this.tasks.get(threadId);
-    if (!state || (state.managedIssue && state.issueStage && state.issueStage !== 'DEVELOPING')) return;
+    if (!state || (state.managedIssue && state.issueStage && !['DEVELOPING','MANUAL_RUNNING'].includes(state.issueStage))) return;
     state.lastActivityAt = Date.now();
     state.turnId = notification.params?.turn?.id ?? state.turnId;
     state.detail = summarizeNotification(notification);
     if (notification.method === 'turn/completed') {
       const turnStatus = notification.params?.turn?.status;
       state.status = turnStatus === 'failed' ? 'failed' : turnStatus === 'interrupted' ? 'stopped' : state.managedIssue ? 'running' : 'completed';
-      if (state.managedIssue && turnStatus === 'completed') state.detail = '本轮 Codex 已结束，Supervisor 将继续验证及处理 CI。';
+      if (state.managedIssue && turnStatus === 'completed') state.detail = state.issueStage==='MANUAL_RUNNING'?'本轮人工指令已结束，保持人工模式，不自动提交或推送。':'本轮 Codex 已结束，Supervisor 将继续验证及处理 CI。';
     }
     if (state.managedIssue) this.scheduleIssueTaskCardUpdate(threadId);
     else await this.updateTaskCard(threadId).catch(error => logger.error('card_update_failed', error, { threadId }));
@@ -471,6 +482,8 @@ export class FeishuGateway {
             }
             this.targets.set(topic.sessionId, { chatId, openId, rootMessageId: topic.rootMessageId });
             this.saveState();
+            const issueReply = await this.routeIssueInput(topic.sessionId, text, openId, messageId);
+            if(issueReply!==undefined){await client.im.message.reply({path:{message_id:topic.rootMessageId},data:{msg_type:'text',content:JSON.stringify({text:issueReply})}});return;}
             if (/^\/(plan|goal|files|skills|apps|context|stop|model|mode|sessions|diff|commit|retry|continue)(?:\s|$)/.test(text)) {
               const reply = await this.handleSessionControl(topic.sessionId, text, { chatId, openId, rootMessageId: topic.rootMessageId });
               const sent = await client.im.message.reply({ path: { message_id: topic.rootMessageId }, data: {
@@ -504,13 +517,13 @@ export class FeishuGateway {
           return;
         }
         const selectedBeforeSend = this.selected.get(openId);
-        if (selectedBeforeSend && !text.startsWith('/')) {
+        if (selectedBeforeSend && !text.startsWith('/') && !this.codex.isIssueManagedSession?.(selectedBeforeSend)) {
           this.targets.set(selectedBeforeSend, { chatId, openId });
           this.saveState();
         }
         const reply = await this.handle(openId, text, client, { chatId }).catch((error) => `执行失败：${formatFeishuError(error)}`);
         const selectedId = this.selected.get(openId);
-        if (selectedId && (!text.startsWith('/') || text.startsWith('/new'))) {
+        if (selectedId && (!text.startsWith('/') || text.startsWith('/new')) && !this.codex.isIssueManagedSession?.(selectedId)) {
           this.targets.set(selectedId, { chatId, openId });
           this.saveState();
         }
@@ -529,6 +542,9 @@ export class FeishuGateway {
         const openId = event.operator?.open_id ?? event.open_id ?? '';
         if (allowed.size && !allowed.has(openId)) return;
         const value = event.action?.value ?? {};
+        if(['issue_takeover','issue_resume_auto'].includes(value.action)){
+          try{const answer=await this.issueControlHandler?.({sessionId:String(value.sessionId??''),actor:openId,action:value.action==='issue_takeover'?'takeover':'resume'});return toastResponse(answer??'人工控制器尚未启用',answer===undefined?'error':'success');}catch(error){return toastResponse(formatFeishuError(error),'error');}
+        }
         if (value.sessionId && ['task_retry','model_select','mode_select','git_commit_confirm','goal_pause','goal_resume','goal_complete','goal_clear'].includes(value.action)) {
           try { this.codex.assertExternalControlAllowed?.(value.sessionId); } catch (error) { return toastResponse(formatFeishuError(error), 'error'); }
         }
@@ -885,13 +901,14 @@ export class FeishuGateway {
       return this.taskCard(thread.id);
     }
     if (command === '/stop') { const id = this.selected.get(user); if (!id) return '请先用 /use 选择 Session'; await this.stopTask(id); return '已发送停止指令'; }
-    if (['/plan', '/goal', '/files', '/skills', '/apps', '/context', '/model', '/mode', '/sessions', '/diff', '/commit', '/retry', '/continue'].includes(command)) {
+    if (['/takeover','/auto','/issue-status','/plan', '/goal', '/files', '/skills', '/apps', '/context', '/model', '/mode', '/sessions', '/diff', '/commit', '/retry', '/continue'].includes(command)) {
       const id = this.selected.get(user); if (!id) return '请先用 /use 选择 Session';
-      return this.handleSessionControl(id, input, this.targets.get(id) ?? { chatId: '', openId: user });
+      return this.handleSessionControl(id, input, { ...(this.targets.get(id) ?? { chatId: '' }), openId: user });
     }
-    if (command === '/help') return '/sessions：查看和切换 Session\n/stop：中止当前任务\n/retry：重试上一条任务\n/continue [指令]：恢复失败任务或向运行中任务追加指令\n/model [模型 ID]：查看或选择模型\n/mode [default|plan]：切换执行模式\n/diff：查看 Git 变更\n/commit [提交说明]：预览并确认提交\n/files、/skills、/apps、/context、/plan、/goal：上下文与计划控制\n\n支持直接发送飞书图片、文件、@相对路径 和 $Skill。';
+    if (command === '/help') return '/takeover：安全接管 Issue 任务（等待当前操作结束）\n/auto [意见]：交回 Issue 自动修改流程\n/issue-status：查看 Issue 控制模式\n/sessions：查看和切换 Session\n/stop：中止当前任务\n/retry：重试上一条任务\n/continue [指令]：恢复失败任务或向运行中任务追加指令\n/model [模型 ID]：查看或选择模型\n/mode [default|plan]：切换执行模式\n/diff：查看 Git 变更\n/commit [提交说明]：预览并确认提交\n/files、/skills、/apps、/context、/plan、/goal：上下文与计划控制\n\n支持直接发送飞书图片、文件、@相对路径 和 $Skill。';
     const id = this.selected.get(user); if (!id) return '请先发送 /sessions，再用 /use <session-id> 选择会话。';
     const target = this.targets.get(id) ?? { chatId: '', openId: user };
+    const issueReply = await this.routeIssueInput(id,input,user);if(issueReply!==undefined)return issueReply;
     const enriched = this.applyPendingReferences(id, user, input);
     await this.enqueue(id, enriched, target, false);
     this.clearPendingReferences(id, user);
@@ -900,6 +917,7 @@ export class FeishuGateway {
 
   private async handleSessionControl(sessionId: string, input: string, target: Target): Promise<Reply> {
     const [command, action = '', ...rest] = input.trim().split(/\s+/);
+    if(['/takeover','/auto','/issue-status'].includes(command)){return await this.routeIssueInput(sessionId,input,target.openId)??'此会话不是受管 Issue 会话。';}
     if (!['/stop','/diff','/files','/skills','/apps'].includes(command)) this.codex.assertExternalControlAllowed?.(sessionId);
     if (command === '/stop') { await this.stopTask(sessionId); return '已发送停止指令。'; }
     if (command === '/retry') {
@@ -1141,9 +1159,13 @@ export class FeishuGateway {
     const actions: Array<Record<string, unknown>> = [
       { tag: 'button', text: { tag: 'plain_text', content: '刷新' }, value: { action: 'task_refresh', sessionId } },
     ];
-    if (status === 'running' && (!state?.managedIssue || state.issueStage === 'DEVELOPING')) actions.unshift({ tag: 'button', type: 'danger', text: { tag: 'plain_text', content: '停止' }, value: { action: 'task_stop', sessionId } });
+    if (status === 'running' && (!state?.managedIssue || ['DEVELOPING','MANUAL_RUNNING'].includes(state.issueStage??''))) actions.unshift({ tag: 'button', type: 'danger', text: { tag: 'plain_text', content: '停止' }, value: { action: 'task_stop', sessionId } });
+    if(state?.managedIssue){
+      if(state.issueStage==='MANUAL')actions.push({tag:'button',type:'primary',text:{tag:'plain_text',content:'继续自动修改'},value:{action:'issue_resume_auto',sessionId}});
+      else if(!['HANDOFF_PENDING','RESUME_PENDING','MANUAL_BLOCKED','MANUAL_RUNNING','PROJECT_DISABLED'].includes(state.issueStage??''))actions.push({tag:'button',text:{tag:'plain_text',content:'人工接管'},value:{action:'issue_takeover',sessionId}});
+    }
     if (!state?.managedIssue && (status === 'failed' || status === 'timeout')) actions.unshift({ tag: 'button', type: 'primary', text: { tag: 'plain_text', content: '重试' }, value: { action: 'task_retry', sessionId } });
-    return { config: { wide_screen_mode: true, update_multi: true }, header: { template: status === 'failed' || status === 'timeout' ? 'red' : status === 'completed' ? 'green' : 'blue', title: { tag: 'plain_text', content: `Codex · ${state?.managedIssue && state.issueStage === 'PR_NOTIFIED' ? 'PR 待审核' : labels[status] ?? status}` } }, elements: [
+    return { config: { wide_screen_mode: true, update_multi: true }, header: { template: status === 'failed' || status === 'timeout' ? 'red' : status === 'completed' ? 'green' : 'blue', title: { tag: 'plain_text', content: `Codex · ${state?.managedIssue ? ({PR_NOTIFIED:'PR 待审核',MANUAL:'人工模式',MANUAL_RUNNING:'人工执行中',HANDOFF_PENDING:'等待安全接管',RESUME_PENDING:'等待恢复自动',MANUAL_BLOCKED:'需核查执行锁'} as Record<string,string>)[state.issueStage??''] ?? labels[status] ?? status : labels[status] ?? status}` } }, elements: [
       { tag: 'div', text: { tag: 'lark_md', content: `**Session**\n${sessionId}\n\n**运行时间** ${elapsed}s　**队列** ${queued}` } },
       { tag: 'div', text: { tag: 'lark_md', content: String(detail).slice(0, 3000) } },
       { tag: 'action', actions },

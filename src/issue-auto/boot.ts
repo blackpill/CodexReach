@@ -1,3 +1,6 @@
+import { HandoffStore } from './handoff-store.js';
+import { HandoffController } from './handoff.js';
+import { createResumeCheck } from './handoff-runtime.js';
 import { NotificationReceipts } from './notification-receipts.js';
 import { DualNotice } from './dual-notice.js';
 import path from 'node:path';
@@ -8,7 +11,7 @@ import { PreviewReview } from './preview-review.js';
 import { createPreviewBuilder, detectLanHost, smokePreview } from './preview-build.js';
 import { startPreviewServer } from './preview-server.js';
 import { randomUUID } from 'node:crypto';
-import { saveCiLog } from './log-store.js';
+import { saveHandoffEvidence, saveCiLog } from './log-store.js';
 import { sendIssueNotice } from './progress-notice.js';
 import { WebhookRedelivery } from './redelivery.js';
 import { IssueStore } from './store.js';
@@ -32,7 +35,8 @@ export function createIssueAutomation(
   const projects = configuredProjects(config).filter((project) => project.enabled);
   if (!projects.length) throw Error('no enabled Issue projects');
   for (const project of projects)
-    if (!feishu.hasProjectGroup(project.projectPath)) throw new Error('请先同步对应项目群');
+    if (!feishu.hasProjectGroup(project.projectPath))
+      throw new Error('请先同步对应项目群');
   const store = new IssueStore(config.dbPath),
     token = randomUUID();
   if (!store.acquireInstance(process.pid, token)) {
@@ -55,6 +59,28 @@ export function createIssueAutomation(
       if (!found) throw Error('unknown or disabled task repository');
       return found;
     };
+    const controls = new HandoffStore(store);
+    const handoff = new HandoffController(store, controls, codex, {
+      checkResume: createResumeCheck(route),
+      isEnabled: (task) => routes.has(task.repositoryId),
+      persistEvidence: saveHandoffEvidence,
+      ui: (sessionId, stage) => feishu.updateIssueStage(sessionId, stage),
+      onManualTurn: (sessionId, turnId) => feishu.recordIssueTurn(sessionId, turnId),
+    });
+    feishu.setIssueControlHandler?.(async (input) => {
+      const id = controls.taskForSession(input.sessionId);
+      if (!id) return undefined;
+      const allowed = new Set(
+        (process.env.FEISHU_ALLOWED_OPEN_IDS ?? '')
+          .split(',')
+          .map((x) => x.trim())
+          .filter(Boolean),
+      );
+      if (!allowed.has(input.actor))
+        throw Error('只有显式飞书白名单用户可以控制 Issue 任务');
+      route(id); // Never control a disabled or unknown repository.
+      return handoff.handle(input);
+    });
     const queue = new ClaimClient(
       config.queueUrl,
       config.queueSecret,
@@ -93,8 +119,12 @@ export function createIssueAutomation(
       const gateway = dual
         ? {
             updateIssueStage: (sessionId: string, stage: string) =>
-              feishu.updateIssueStage(sessionId, stage),
-            sendIssueAutoNotice: (projectPath: string, text: string, sessionId?: string) =>
+              feishu.updateIssueStage(sessionId, controls.uiStage(id, stage)),
+            sendIssueAutoNotice: (
+              projectPath: string,
+              text: string,
+              sessionId?: string,
+            ) =>
               dual!.send({
                 key: `task:${id}:v${before?.version}`,
                 projectPath,
@@ -163,15 +193,12 @@ export function createIssueAutomation(
             (id) => store.get(id)?.repositoryId === 1444221313,
           )
         : undefined;
-    store.setProgressObserver((_taskId, stage, context) => {
+    store.setProgressObserver((taskId, stage, context) => {
       if (typeof context.threadId === 'string')
-        void feishu.updateIssueStage(context.threadId, stage).catch(onError);
+        void feishu
+          .updateIssueStage(context.threadId, controls.uiStage(taskId, stage))
+          .catch(onError);
     });
-    for (const id of store.listActive()) {
-      const progress = store.getProgress(id);
-      if (progress && typeof progress.context.threadId === 'string')
-        void feishu.updateIssueStage(progress.context.threadId, progress.stage).catch(onError);
-    }
     const coordinators = new Map(
       projects.map((project) => [
         project.repositoryId,
@@ -179,7 +206,8 @@ export function createIssueAutomation(
           store,
           createRuntimeOps(project, routes.get(project.repositoryId)!.gh, codex, feishu, {
             ...runtimeIO,
-            reserveSession: (sessionId, taskId) => store.reserveSession(sessionId, taskId),
+            reserveSession: (sessionId, taskId) =>
+              store.reserveSession(sessionId, taskId),
           }),
         ),
       ]),
@@ -246,10 +274,12 @@ export function createIssueAutomation(
               if (result.status === 'rejected') onError(result.reason);
           }
         : undefined,
+      () => handoff.step(),
     );
     return {
       start: () => service.start(),
       stop: async () => {
+        feishu.setIssueControlHandler?.(undefined);
         await service.stop();
         await previews?.stop();
         previewStore?.close();
@@ -259,6 +289,7 @@ export function createIssueAutomation(
       },
     };
   } catch (error) {
+    feishu.setIssueControlHandler?.(undefined);
     previewStore?.close();
     receipts?.close();
     store.releaseInstance(token);

@@ -108,7 +108,8 @@ export class CodexClient extends EventEmitter {
   }
 
   setIssueSessionGuard(guard?: (threadId:string)=>boolean) { this.issueSessionGuard = guard; }
-  assertExternalControlAllowed(threadId:string) { if(this.issueSessionGuard?.(threadId)) throw new Error('该 Session 由 Issue 自动任务管理，请在其他 Session 操作；需要接管时先停止自动任务并核对进程。'); }
+  isIssueManagedSession(threadId:string): boolean { return this.issueSessionGuard?.(threadId) ?? false; }
+  assertExternalControlAllowed(threadId:string) { if(this.issueSessionGuard?.(threadId)) throw new Error('该 Session 由 Issue 自动任务管理，请在原飞书话题点击“人工接管”或发送 /takeover；确认人工模式后提交修改意见，再用 /auto 继续自动修改。'); }
   async send(threadId: string, text: string) { this.assertExternalControlAllowed(threadId); return this.sendManaged(threadId,text); }
   async sendManaged(threadId: string, text: string) {
     const thread = await this.readThread(threadId);

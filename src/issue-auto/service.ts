@@ -17,6 +17,7 @@ export class IssueService {
     private interval = 10000,
     private checkReady?: (taskId: string) => Promise<void>,
     private checkWebhook?: () => Promise<void>,
+    private handoff?: () => Promise<void>,
   ) {}
   start(): void {
     if (!this.stopped) return;
@@ -37,6 +38,11 @@ export class IssueService {
       } catch (e) {
         this.onError(e);
       }
+      try {
+        await this.handoff?.();
+      } catch (error) {
+        this.onError(error);
+      }
       let executionSafe = true;
       try {
         this.store.recoverExecution();
@@ -55,6 +61,16 @@ export class IssueService {
             : []
           : active.slice(0, 1);
       for (const taskId of selected) {
+        const controlProgress = this.store.getProgress(taskId);
+        if (
+          !controlProgress ||
+          !this.store.canAdvanceAutomatic(
+            taskId,
+            controlProgress.stage,
+            controlProgress.context.phase,
+          )
+        )
+          continue;
         try {
           if (this.store.getProgress(taskId)?.stage === 'CI_CHECKING')
             await this.checkCi(taskId);
@@ -64,8 +80,14 @@ export class IssueService {
           const p = this.store.getProgress(taskId);
           if (p && p.stage !== 'CI_CHECKING') {
             const errors =
-              p.context.lastErrorStage === p.stage ? Number(p.context.taskErrors ?? 0) + 1 : 1;
-            const context = { ...p.context, lastErrorStage: p.stage, taskErrors: errors };
+              p.context.lastErrorStage === p.stage
+                ? Number(p.context.taskErrors ?? 0) + 1
+                : 1;
+            const context = {
+              ...p.context,
+              lastErrorStage: p.stage,
+              taskErrors: errors,
+            };
             if (errors >= 3)
               this.store.transition(
                 taskId,
@@ -91,7 +113,8 @@ export class IssueService {
         }
       if (
         this.checkWebhook &&
-        (this.lastWebhookCheck === undefined || Date.now() - this.lastWebhookCheck >= 300_000)
+        (this.lastWebhookCheck === undefined ||
+          Date.now() - this.lastWebhookCheck >= 300_000)
       ) {
         this.lastWebhookCheck = Date.now();
         try {
