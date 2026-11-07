@@ -1,7 +1,7 @@
 """Read CodexReach SQLite snapshots; push outbound SSH only. No Codex controls."""
 import argparse,datetime,json,sqlite3,subprocess,sys
 from pathlib import Path
-ALLOWED={1444221313,1223017142,1316936114}
+ALLOWED={1444221313,1223017142,1316936114,1336698184,1356671174}
 def snapshot(db):
  c=sqlite3.connect('file:'+str(Path(db).resolve())+'?mode=ro',uri=True);c.row_factory=sqlite3.Row
  rows=c.execute('select t.repository_id,t.issue_number,t.task_id,p.stage,p.version,p.context from issue_auto_tasks t join issue_auto_progress p on p.task_id=t.task_id').fetchall();c.close();out=[]

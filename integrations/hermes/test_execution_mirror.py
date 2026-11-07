@@ -32,11 +32,11 @@ class SnapshotScopeTests(unittest.TestCase):
    c=sqlite3.connect(db)
    c.execute('create table issue_auto_tasks (repository_id integer,issue_number integer,task_id text)')
    c.execute('create table issue_auto_progress (task_id text,stage text,version integer,context text)')
-   for repo,task in [(1316936114,'color'),(999,'unknown')]:
+   for repo,task in [(1316936114,'color'),(1336698184,'android'),(1356671174,'ios'),(999,'unknown')]:
     c.execute('insert into issue_auto_tasks values(?,?,?)',(repo,1,task))
     c.execute('insert into issue_auto_progress values(?,?,?,?)',(task,'DEVELOPING',1,json.dumps({})))
    c.commit();c.close()
-   self.assertEqual([x['repository_id'] for x in snapshot(db)],[1316936114])
+   self.assertEqual([x['repository_id'] for x in snapshot(db)],[1316936114,1336698184,1356671174])
 
 class MixedBatchTests(unittest.TestCase):
  def test_receiver_requires_registration_before_accepting_mixed_snapshot_batch(self):
@@ -52,5 +52,19 @@ class MixedBatchTests(unittest.TestCase):
    projects['colorearmundo']={'repository_id':1316936114,'repository':'blackpill/colorearmundo.com'}
    self.assertEqual(ingest(db,projects,[dict(old,version=2),color]),2)
    with sqlite3.connect(db) as c:self.assertEqual(c.execute('select count(*) from executions').fetchone()[0],2)
+
+
+ def test_mobile_batches_require_pre_registered_receiver(self):
+  import sqlite3
+  for repo,name in [(1336698184,'BluetoothClicker'),(1356671174,'endoscope-iOS')]:
+   with self.subTest(repo=repo),tempfile.TemporaryDirectory() as t:
+    db=Path(t)/'mirror.db'; projects={'usmapgames':{'repository_id':1444221313,'repository':'blackpill/usmapgames.com'}}
+    old={'repository_id':1444221313,'issue_number':9,'task_id':'old','stage':'DEVELOPING','version':1}
+    mobile={'repository_id':repo,'issue_number':2,'task_id':'mobile','stage':'RECEIVED','version':1}
+    self.assertEqual(ingest(db,projects,[old]),1)
+    with self.assertRaises(ValueError):ingest(db,projects,[dict(old,version=2),mobile])
+    with sqlite3.connect(db) as c:self.assertEqual(c.execute('select version from executions').fetchone()[0],1)
+    projects['mobile']={'repository_id':repo,'repository':'blackpill/'+name}
+    self.assertEqual(ingest(db,projects,[dict(old,version=2),mobile]),2)
 
 if __name__=='__main__':unittest.main()

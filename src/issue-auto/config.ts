@@ -12,7 +12,7 @@ export type ProjectConfig = {
   projectPath: string;
   worktreeRoot: string;
   expectedRemote: string;
-  packageManager: 'npm' | 'pnpm';
+  packageManager: 'npm' | 'pnpm' | 'gradle' | 'swift';
   install: ValidationCommand;
   validate: ValidationCommand[];
   build: ValidationCommand;
@@ -188,7 +188,11 @@ function parseProjects(raw: string): ProjectConfig[] {
       !path.isAbsolute(value.projectPath) ||
       ids.has(value.repositoryId) ||
       paths.has(path.resolve(value.projectPath)) ||
-      !['npm', 'pnpm'].includes(value.packageManager) ||
+      !['npm', 'pnpm', 'gradle', 'swift'].includes(value.packageManager) ||
+      (value.packageManager === 'gradle' && value.repositoryId !== 1336698184) ||
+      (value.packageManager === 'swift' && value.repositoryId !== 1356671174) ||
+      (value.repositoryId === 1336698184 && value.packageManager !== 'gradle') ||
+      (value.repositoryId === 1356671174 && value.packageManager !== 'swift') ||
       ![
         `https://github.com/blackpill/${value.repo}.git`,
         `git@github.com:blackpill/${value.repo}.git`,
@@ -212,7 +216,7 @@ function parseProjects(raw: string): ProjectConfig[] {
     const command = (c: any): ValidationCommand => {
       if (
         !c ||
-        c.executable !== value.packageManager ||
+        !(value.packageManager === 'gradle' ? c.executable === './gradlew' : value.packageManager === 'swift' ? ['swift', 'xcodebuild'].includes(c.executable) : c.executable === value.packageManager) ||
         !Array.isArray(c.args) ||
         !c.args.length ||
         c.args.some((x: unknown) => typeof x !== 'string' || x.includes('\0'))

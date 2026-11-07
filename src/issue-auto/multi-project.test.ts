@@ -431,8 +431,8 @@ it('rechecks repository ID before publishing and never pushes a renamed/reclaime
 it('accepts the three new explicitly pinned repositories and rejects mismatched IDs', () => {
   const additions = [
     { repositoryId: 1316936114, repo: 'colorearmundo.com' },
-    { repositoryId: 1336698184, repo: 'BluetoothClicker' },
-    { repositoryId: 1356671174, repo: 'endoscope-iOS' },
+    { repositoryId: 1336698184, repo: 'BluetoothClicker', packageManager:'gradle', install:{executable:'./gradlew',args:['--version']}, validate:[{executable:'./gradlew',args:['test']}], build:{executable:'./gradlew',args:['build']} },
+    { repositoryId: 1356671174, repo: 'endoscope-iOS', packageManager:'swift', install:{executable:'swift',args:['package','resolve']}, validate:[{executable:'swift',args:['test']}], build:{executable:'xcodebuild',args:['-version']} },
   ];
   for (const item of additions) {
     const entry = { ...project, ...item, enabled: false, projectPath: `/private/${item.repo}`,
@@ -455,4 +455,18 @@ it('accepts colorearmundo when explicitly enabled but rejects its unaudited prev
     validate: [{ executable: 'npm', args: ['test'] }], build: { executable: 'npm', args: ['run', 'build'] }, previewEnabled: false };
   expect(readIssueConfig({ ...env, ISSUE_AUTO_PROJECTS_JSON: JSON.stringify([color]) })?.projects?.[0]).toMatchObject({ enabled: true, previewEnabled: false });
   expect(() => readIssueConfig({ ...env, ISSUE_AUTO_PROJECTS_JSON: JSON.stringify([{...color, previewEnabled:true}]) })).toThrow();
+});
+
+it('permits scoped Android and iOS command contracts while rejecting cross-platform executables', () => {
+  const android = { ...project, enabled: false, repositoryId: 1336698184, repo: 'BluetoothClicker', projectPath: '/private/android', expectedRemote: 'git@github.com:blackpill/BluetoothClicker.git', packageManager: 'gradle', install: {executable:'./gradlew', args:['--version']}, validate:[{executable:'./gradlew',args:[':app:testPlayDebugUnitTest',':app:assemblePlayDebug','--no-daemon']}], build:{executable:'./gradlew',args:[':app:assemblePlayDebug']}, previewEnabled:false };
+  const ios = { ...project, enabled: false, repositoryId: 1356671174, repo: 'endoscope-iOS', projectPath: '/private/ios', expectedRemote: 'git@github.com:blackpill/endoscope-iOS.git', packageManager: 'swift', install: {executable:'swift',args:['package','resolve']}, validate:[{executable:'swift',args:['test']},{executable:'xcodebuild',args:['-version']}], build:{executable:'xcodebuild',args:['-version']}, previewEnabled:false };
+  const parse = (entries: unknown[]) => readIssueConfig({ ...env, ISSUE_AUTO_PROJECTS_JSON:JSON.stringify(entries) });
+  expect(parse([android,ios])?.projects).toHaveLength(2);
+  expect(() => parse([{...android,validate:[{executable:'sh',args:['-c','echo bad']}]}])).toThrow();
+  expect(() => parse([{...ios,validate:[{executable:'./gradlew',args:['test']}]}])).toThrow();
+  expect(() => parse([{...android, packageManager:'swift'}])).toThrow();
+  expect(() => parse([{...android, packageManager:'npm',install:{executable:'npm',args:['ci']},validate:[{executable:'npm',args:['test']}],build:{executable:'npm',args:['run','build']}}])).toThrow();
+  expect(() => parse([{...project,packageManager:'gradle'}])).toThrow();
+  expect(() => parse([{...android,enabled:true}])).toThrow('not yet verified');
+  expect(() => parse([{...ios,enabled:true}])).toThrow('not yet verified');
 });
