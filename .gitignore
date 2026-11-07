@@ -4,3 +4,6 @@ dist-web/
 .data/
 .env
 *.log
+
+.superpowers/
+__pycache__/

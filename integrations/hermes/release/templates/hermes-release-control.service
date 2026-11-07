@@ -1,0 +1,20 @@
+[Unit]
+Description=ClassGames manual release controller (install only after separate approval)
+After=network-online.target
+[Service]
+User=classgames-release
+Group=classgames-release
+WorkingDirectory=/srv/hermes/release-control/code
+EnvironmentFile=/etc/classgames-release-control.env
+ExecStart=/srv/hermes/release-control/venv/bin/python -m integrations.hermes.release.runtime
+RuntimeDirectory=classgames-release
+RuntimeDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/hermes/release-control/state /run/classgames-release
+Restart=on-failure
+RestartSec=10
+# No Install section: deliberately not enableable until the rollout is approved.
