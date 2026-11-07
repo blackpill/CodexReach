@@ -19,7 +19,7 @@ git_commit: 885e3c2a5553b88d41d3366cdc346c238ceafe79
 
 可信发布工具不运行网站依赖/构建脚本；票据从事件文件读取，不经步骤环境变量展开。未知结果先对账，最多一次受控部署尝试，不承诺供应商 API 严格 exactly-once。
 
-验证：Bot389、Worker8、Python96项通过；check:all/build通过。既有Python3.14 SQLite ResourceWarning已记录，没有通过屏蔽或删除测试隐藏。
+验证：重放到远端main后，Bot203、Worker8、Python73项通过；check:all/build通过。先前389/96的集成基线结果保留在历史离线记录，不属于本PR额外引入的功能。既有Python3.14 SQLite ResourceWarning已记录，没有通过屏蔽或删除测试隐藏。
 
 此PR不安装服务、不创建App/密钥、不启用生产、不重启Mac或Hermes。
 
@@ -42,8 +42,8 @@ git_commit: 885e3c2a5553b88d41d3366cdc346c238ceafe79
 ## 提交前检查
 
 - [x] 用户明确授权两仓 git commit、推送和创建待审核PR；不会因此合并或部署。
-- [ ] 只暂存两个隔离工作区中属于本功能的文件，不带`.superpowers`、node_modules、构建产物、.env或真实凭据。
-- [ ] 再确认远端main是否变化，必要时在隔离分支解决冲突并重新回归；不修改用户原checkout。
+- [x] 只暂存两个隔离工作区中属于本功能的文件，不带`.superpowers`、node_modules、构建产物、.env或真实凭据。
+- [x] 已核对远端main；控制器仅重放本功能提交到d8ecc6f，未带入原基线9个其他本地提交；重放后已重新回归。网站main未变。不修改用户原checkout。
 - [ ] 审阅PR1可信工具后，将实际固定提交SHA提供给PR2；不把main/latest作为替代。
 
 ## 真实配置前需单独确认

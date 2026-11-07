@@ -18,6 +18,8 @@ git_commit: d8ecc6f42a8f96f3e1597943568a4ba49c2d68ed
 
 ## test
 
+- [ClassGames PR交接和新基线验证](test/2026-11-08-classgames-release-pr-handoff.md)
+
 - [2026-11-07-classgames-manual-release-offline](test/2026-11-07-classgames-manual-release-offline.md)
 - [2026-11-07-classgames-release-preflight](test/2026-11-07-classgames-release-preflight.md)
 

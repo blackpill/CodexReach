@@ -62,3 +62,7 @@ Python 3.14 的既有 Hermes 测试存在 SQLite ResourceWarning；已在本功�
 ## PR 准备
 
 已整理[双仓库 PR 草稿和启用门槛](classgames-manual-release-pr-drafts.md)，已于2026-11-08取得提交/推送及创建待审核PR的授权；真实发布仍须另行确认。网站新增独立 Release Contracts CI，使用只读权限在 PR/main push 运行发布合同测试；生产发布仍仅 workflow_dispatch。
+
+## 2026-11-08 PR基线更新
+
+用户已授权提交/推送及创建两个待审核PR，但未授权合并、部署或生产权限。控制器仅重放本功能到远端main，未带入其他本地功能；新基线测试为203/8/73项，详见[PR交接](../test/2026-11-08-classgames-release-pr-handoff.md)。
