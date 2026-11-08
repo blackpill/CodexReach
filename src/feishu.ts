@@ -1,3 +1,4 @@
+import { installChatIoQuarantine } from './chat-io-quarantine.js';
 import * as lark from '@larksuiteoapi/node-sdk';
 import type {TopicReceipt} from './issue-auto/dual-notice.js';
 import {preciseTopicLink,directNoticeContent} from './issue-auto/feishu-notice.js';
@@ -412,7 +413,10 @@ export class FeishuGateway {
     const appId = process.env.FEISHU_APP_ID, appSecret = process.env.FEISHU_APP_SECRET;
     if (!appId || !appSecret) return false;
     const allowed = new Set((process.env.FEISHU_ALLOWED_OPEN_IDS ?? '').split(',').filter(Boolean));
+    const quarantine=(chatId:string)=>this.stateStore.isProjectChatQuarantined(chatId);
+    for (const id of (process.env.FEISHU_QUARANTINED_CHAT_IDS??'').split(',').map(x=>x.trim()).filter(Boolean)) this.stateStore.quarantineProjectChat(id,'operator configured isolation');
     const client = new lark.Client({ appId, appSecret });
+    installChatIoQuarantine(client,quarantine);
     this.client = client;
     const dispatcher = new lark.EventDispatcher({}).register({
       'im.message.receive_v1': async (event: any) => {
@@ -427,6 +431,7 @@ export class FeishuGateway {
           this.saveState();
         }
         const chatId = event.message.chat_id;
+        if (quarantine(chatId)) return;
         // 部分飞书消息事件不返回 thread_id，但话题回复一定带稳定的 root_id。
         const rawThreadId = event.message.thread_id ?? '';
         const threadId = rawThreadId || event.message.root_id || '';
@@ -528,6 +533,8 @@ export class FeishuGateway {
       'card.action.trigger': async (event: any) => {
         const openId = event.operator?.open_id ?? event.open_id ?? '';
         if (allowed.size && !allowed.has(openId)) return;
+        const originChat=event.context?.open_chat_id;
+        if(typeof originChat!=='string'||!/^oc_[A-Za-z0-9]+$/.test(originChat)||quarantine(originChat)) return toastResponse('来源未验证或群已隔离','error');
         const value = event.action?.value ?? {};
         if (value.sessionId && ['task_retry','model_select','mode_select','git_commit_confirm','goal_pause','goal_resume','goal_complete','goal_clear'].includes(value.action)) {
           try { this.codex.assertExternalControlAllowed?.(value.sessionId); } catch (error) { return toastResponse(formatFeishuError(error), 'error'); }
@@ -551,6 +558,7 @@ export class FeishuGateway {
         if (value.action === 'bind_project_confirm') {
           const project = projects.find((item) => item.path === value.projectPath);
           if (!project || !value.chatId) return toastResponse('项目不存在或群信息已失效', 'error');
+          if(value.chatId!==originChat||quarantine(value.chatId))return toastResponse('拒绝绑定隔离或不同来源群','error');
           this.projectGroups.set(project.path, { projectPath: project.path, projectName: project.name, chatId: value.chatId });
           this.saveState();
           logger.info('project_binding_confirmed', { projectPath: project.path, chatId: value.chatId });
@@ -1413,6 +1421,7 @@ export class FeishuGateway {
   }
 
   private async recoverProjectBinding(chatId: string, threadId: string, rootMessageId: string): Promise<{ group?: ProjectGroup; candidates: Project[] }> {
+    if(this.stateStore.isProjectChatQuarantined(chatId)) return {candidates:[]};
     const evidence = new Set<string>();
     for (const [sessionId, target] of this.targets) {
       if (target.chatId !== chatId) continue;
@@ -1442,6 +1451,7 @@ export class FeishuGateway {
 
   private async ensureProjectGroup(client: lark.Client, project: Project, ownerOpenId: string): Promise<ProjectGroup> {
     const existing = this.projectGroups.get(project.path);
+    if(existing && this.stateStore.isProjectChatQuarantined(existing.chatId)) throw Error('项目群已隔离');
     if (existing) {
       // 每次同步都校正名称、话题消息模式和 CodexReach 标签。
       const updated = await client.im.chat.update({ path: { chat_id: existing.chatId }, params: { user_id_type: 'open_id' }, data: {
@@ -1450,7 +1460,7 @@ export class FeishuGateway {
       if (updated.code) throw new Error(`更新群「${project.name}」失败：${updated.msg}`);
       return existing;
     }
-    const created = await client.im.chat.create({ params: { user_id_type: 'open_id', set_bot_manager: true, uuid: `codexreach-${project.id}`.slice(0, 50) }, data: {
+    const created = await client.im.chat.create({ params: { user_id_type: 'open_id', set_bot_manager: true, uuid: `codexreach-${createHash('sha256').update(project.path).digest('hex').slice(0,32)}` }, data: {
       name: projectGroupName(project.name),
       description: `CodexReach Project\n${project.path}`,
       owner_id: ownerOpenId,
@@ -1460,6 +1470,7 @@ export class FeishuGateway {
       chat_type: 'private',
     }});
     if (created.code || !created.data?.chat_id) throw new Error(`创建群「${project.name}」失败：${created.msg ?? '未返回 chat_id'}`);
+    if(this.stateStore.isProjectChatQuarantined(created.data.chat_id)) throw Error('拒绝绑定已隔离的群');
     const link = await client.im.chat.link({ path: { chat_id: created.data.chat_id }, data: { validity_period: 'permanently' } });
     const group = { projectPath: project.path, projectName: project.name, chatId: created.data.chat_id, shareLink: link.data?.share_link };
     this.projectGroups.set(project.path, group);
