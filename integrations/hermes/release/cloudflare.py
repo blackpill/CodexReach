@@ -22,6 +22,6 @@ class CloudflareReadClient:
   stable['domains']=domain_state
   return {'version_id':vid,'deployment_id':dep['id'],'source_sha':None,'config_digest':hashlib.sha256(json.dumps(stable,sort_keys=True,separators=(',',':')).encode()).hexdigest()}
  def health(self,sha):
-  d=self.transport('GET','https://classgames.net/__release.json?sha='+sha,None,{'Cache-Control':'no-cache'})
+  d=self.transport('GET','https://classgames.net/__release.json?sha='+sha,None,{'Cache-Control':'no-cache','User-Agent':'ClassGamesReleaseHealth/1.0','Accept':'application/json'})
   from .smoke import smoke
   return d=={'sha':sha} and smoke()
