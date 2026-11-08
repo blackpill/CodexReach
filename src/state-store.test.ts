@@ -48,3 +48,16 @@ describe('StateStore', () => {
     stale.close(); current.close();
   });
 });
+
+it('persists an irreversible project chat quarantine across instances without modifying existing snapshots', () => {
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'chat-quarantine-'));dirs.push(dir);const database=path.join(dir,'state.sqlite');
+ const a=new StateStore(database,path.join(dir,'missing.json'));const b=new StateStore(database,path.join(dir,'missing.json'));
+ try {
+  a.saveSnapshot({projectGroups:[['/a',{chatId:'oc_old'}]],sessionTopics:[['s',{chatId:'oc_old',rootMessageId:'om_old'}]]});
+  expect(a.isProjectChatQuarantined('oc_old')).toBe(false);
+  a.quarantineProjectChat('oc_old','shared project binding');
+  expect(b.isProjectChatQuarantined('oc_old')).toBe(true);
+  expect(()=>b.quarantineProjectChat('', 'bad')).toThrow();
+  expect(a.loadSnapshot()).toMatchObject({projectGroups:[['/a',{chatId:'oc_old'}]],sessionTopics:[['s',{chatId:'oc_old',rootMessageId:'om_old'}]]});
+ } finally {a.close();b.close();}
+});

@@ -367,3 +367,9 @@ it('renders the explicitly allowed colorearmundo GitHub link in a direct notice'
   const unsafe = JSON.stringify(directNoticeContent('https://github.com/blackpill/colorearmundo.com.evil/pull/1', 'https://applink.feishu.cn/client/thread/open'));
   expect(unsafe).not.toContain('\"tag\":\"a\",\"text\":\"https://github.com/blackpill/colorearmundo.com.evil');
 });
+
+it('does not reuse a truncated path prefix as group creation identity',async()=>{
+ const g=new FeishuGateway({} as any) as any;const create=vi.fn().mockResolvedValueOnce({code:0,data:{chat_id:'oc_newone'}}).mockResolvedValueOnce({code:0,data:{chat_id:'oc_newtwo'}});const c={im:{chat:{create,link:vi.fn().mockResolvedValue({data:{share_link:'link'}})}}};
+ for(const path of ['/Users/kenny/Documents/ChatGPT/BluetoothMouseKeyboard','/Users/kenny/Documents/ChatGPT/endoscope'])await g.ensureProjectGroup(c,{id:Buffer.from(path).toString('base64url'),path,name:'p'},'ou_u');
+ expect(create.mock.calls[0][0].params.uuid).not.toBe(create.mock.calls[1][0].params.uuid);
+});

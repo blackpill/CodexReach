@@ -62,11 +62,23 @@ export class StateStore {
       CREATE INDEX IF NOT EXISTS turn_correlations_session_turn_idx
         ON turn_correlations(session_id, turn_id);
 
+      CREATE TABLE IF NOT EXISTS quarantined_project_chats (chat_id TEXT PRIMARY KEY, reason TEXT NOT NULL, created_at TEXT NOT NULL);
+
       CREATE TABLE IF NOT EXISTS migrations (
         name TEXT PRIMARY KEY,
         applied_at TEXT NOT NULL
       );
     `);
+  }
+
+  isProjectChatQuarantined(chatId: string): boolean {
+    if (!/^oc_[A-Za-z0-9]+$/.test(chatId)) throw new Error('invalid project chat identity');
+    return !!this.db.prepare('SELECT 1 FROM quarantined_project_chats WHERE chat_id=?').get(chatId);
+  }
+
+  quarantineProjectChat(chatId: string, reason: string): void {
+    if (!/^oc_[A-Za-z0-9]+$/.test(chatId) || !reason.trim()) throw new Error('invalid quarantine');
+    this.db.prepare('INSERT OR IGNORE INTO quarantined_project_chats(chat_id,reason,created_at) VALUES (?,?,?)').run(chatId,reason,new Date().toISOString());
   }
 
   private importLegacyJsonOnce() {
