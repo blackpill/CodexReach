@@ -439,7 +439,7 @@ it('accepts the three new explicitly pinned repositories and rejects mismatched 
       expectedRemote: `git@github.com:blackpill/${item.repo}.git` };
     const config = readIssueConfig({ ...env, ISSUE_AUTO_PROJECTS_JSON: JSON.stringify([entry]) });
     expect(config?.projects?.[0]).toMatchObject(item);
-    if (item.repo !== 'colorearmundo.com') expect(() => readIssueConfig({ ...env, ISSUE_AUTO_PROJECTS_JSON: JSON.stringify([{ ...entry, enabled: true }]) })).toThrow('not yet verified');
+    expect(readIssueConfig({ ...env, ISSUE_AUTO_PROJECTS_JSON: JSON.stringify([{ ...entry, enabled: true }]) })?.projects?.[0].enabled).toBe(true);
     expect(() => readIssueConfig({ ...env, ISSUE_AUTO_PROJECTS_JSON: JSON.stringify([{ ...entry, repositoryId: 999 }]) })).toThrow();
   }
   const entries = [project, { ...project, repositoryId: 1444221313, repo: 'usmapgames.com', projectPath: '/private/usmap', expectedRemote: 'git@github.com:blackpill/usmapgames.com.git' },
@@ -467,6 +467,6 @@ it('permits scoped Android and iOS command contracts while rejecting cross-platf
   expect(() => parse([{...android, packageManager:'swift'}])).toThrow();
   expect(() => parse([{...android, packageManager:'npm',install:{executable:'npm',args:['ci']},validate:[{executable:'npm',args:['test']}],build:{executable:'npm',args:['run','build']}}])).toThrow();
   expect(() => parse([{...project,packageManager:'gradle'}])).toThrow();
-  expect(() => parse([{...android,enabled:true}])).toThrow('not yet verified');
-  expect(() => parse([{...ios,enabled:true}])).toThrow('not yet verified');
+  expect(parse([{...android,enabled:true}])?.projects?.[0].enabled).toBe(true);
+  expect(parse([{...ios,enabled:true}])?.projects?.[0].enabled).toBe(true);
 });

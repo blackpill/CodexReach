@@ -209,8 +209,6 @@ function parseProjects(raw: string): ProjectConfig[] {
       (value.previewEnabled !== undefined && typeof value.previewEnabled !== 'boolean')
     )
       throw Error('invalid project configuration');
-    if ([1336698184, 1356671174].includes(value.repositoryId) && value.enabled)
-      throw Error('new project execution is not yet verified');
     if (value.repositoryId !== 1444221313 && value.previewEnabled === true)
       throw Error('project preview contract is not available');
     const command = (c: any): ValidationCommand => {
