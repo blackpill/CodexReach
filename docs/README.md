@@ -1,16 +1,18 @@
 ---
-updated_at: 2026-11-08T00:00:00+08:00
-git_commit: d8ecc6f42a8f96f3e1597943568a4ba49c2d68ed
+updated_at: 2026-11-08T20:08:44+08:00
+git_commit: 86d06c9e1eabd5e7fddc5e35eaf8b7d31a8e6b27
 ---
 
 # 文档索引
 
 ## spec
 
+- [USMapGames / ColorearMundo 人工发布接入设计](spec/2026-11-08-two-site-manual-release-design.md)
 - [2026-11-07-hermes-manual-release-design](spec/2026-11-07-hermes-manual-release-design.md)
 
 ## implement
 
+- [两站人工发布实施计划](implement/2026-11-08-two-site-manual-release-plan.md)
 - [2026-11-07-classgames-manual-release-plan](implement/2026-11-07-classgames-manual-release-plan.md)
 - [classgames-manual-release-pr-drafts](implement/classgames-manual-release-pr-drafts.md)
 - [classgames-manual-release](implement/classgames-manual-release.md)
@@ -18,6 +20,7 @@ git_commit: d8ecc6f42a8f96f3e1597943568a4ba49c2d68ed
 
 ## test
 
+- [两站人工发布离线验证与授权边界](test/2026-11-08-two-site-release-offline.md)
 - [ClassGames PR交接和新基线验证](test/2026-11-08-classgames-release-pr-handoff.md)
 
 - [2026-11-07-classgames-manual-release-offline](test/2026-11-07-classgames-manual-release-offline.md)
