@@ -373,3 +373,19 @@ it('does not reuse a truncated path prefix as group creation identity',async()=>
  for(const path of ['/Users/kenny/Documents/ChatGPT/BluetoothMouseKeyboard','/Users/kenny/Documents/ChatGPT/endoscope'])await g.ensureProjectGroup(c,{id:Buffer.from(path).toString('base64url'),path,name:'p'},'ou_u');
  expect(create.mock.calls[0][0].params.uuid).not.toBe(create.mock.calls[1][0].params.uuid);
 });
+
+it('does not advertise shared or quarantined project bindings as ready for automatic execution',()=>{
+ const g=new FeishuGateway({} as any) as any;g.client={};
+ g.projectGroups.set('/a',{projectPath:'/a',chatId:'oc_shared'});g.projectGroups.set('/b',{projectPath:'/b',chatId:'oc_shared'});
+ expect(g.hasProjectGroup('/a')).toBe(false);expect(g.hasProjectGroup('/b')).toBe(false);
+ g.projectGroups.delete('/b');g.stateStore.quarantineProjectChat('oc_shared','old mixed group');expect(g.hasProjectGroup('/a')).toBe(false);
+});
+
+it('rejects runtime Issue binding and notifications after project chats become shared',async()=>{
+ const g=new FeishuGateway({} as any) as any;const create=vi.fn(),reply=vi.fn();g.client={im:{message:{create,reply}}};
+ g.projectGroups.set('/a',{projectPath:'/a',chatId:'oc_sharedruntime'});g.projectGroups.set('/b',{projectPath:'/b',chatId:'oc_sharedruntime'});
+ await expect(g.bindIssueSession('/a','s','issue')).rejects.toThrow();
+ await expect(g.sendIssueTopicRecord({projectPath:'/a',message:'m',uuid:'u'})).rejects.toThrow();
+ await expect(g.sendIssueAutoNotice('/a','m')).rejects.toThrow();
+ expect(create).not.toHaveBeenCalled();expect(reply).not.toHaveBeenCalled();
+});

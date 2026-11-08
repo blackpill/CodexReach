@@ -102,7 +102,12 @@ export class FeishuGateway {
     this.evaluationDueHandler = handler;
   }
 
-  hasProjectGroup(projectPath: string): boolean { return !!this.client && this.projectGroups.has(projectPath); }
+  hasProjectGroup(projectPath: string): boolean {
+    const group=this.projectGroups.get(projectPath);
+    if(!this.client||!group)return false;
+    if(group.chatId.startsWith('oc_')&&this.stateStore.isProjectChatQuarantined(group.chatId))return false;
+    return ![...this.projectGroups.entries()].some(([path,other])=>path!==projectPath&&other.chatId===group.chatId);
+  }
   async recordIssueTurn(sessionId: string, turnId: string): Promise<void> {
     try { this.recordBridgeTurn(sessionId, turnId); } catch (error) { logger.error('issue_turn_correlation_failed', error, { sessionId }); }
     const prior = this.tasks.get(sessionId);
@@ -172,6 +177,7 @@ export class FeishuGateway {
     if (!this.client) throw new Error('飞书客户端尚未初始化');
     const group = this.projectGroups.get(projectPath);
     if (!group) throw new Error('找不到 Issue 任务对应的项目群');
+    if (!this.hasProjectGroup(projectPath)) throw new Error('项目群重复或已隔离');
     const topic = await this.ensureSessionTopic(this.client, group, sessionId, title);
     this.targets.set(sessionId, { chatId: group.chatId, openId: '', rootMessageId: topic.rootMessageId });
     this.saveState();
@@ -179,7 +185,7 @@ export class FeishuGateway {
   }
 
   async sendIssueTopicRecord(input:{projectPath:string;message:string;sessionId?:string;uuid:string}):Promise<TopicReceipt> {
-    if(!this.client)throw Error('飞书客户端尚未初始化');const group=this.projectGroups.get(input.projectPath);if(!group)throw Error('找不到 Issue 任务对应的项目群');
+    if(!this.client)throw Error('飞书客户端尚未初始化');const group=this.projectGroups.get(input.projectPath);if(!group)throw Error('找不到 Issue 任务对应的项目群');if(!this.hasProjectGroup(input.projectPath))throw Error('项目群重复或已隔离');
     const topic=input.sessionId?this.sessionTopics.get(input.sessionId):undefined;
     if(input.sessionId&&(!topic||topic.chatId!==group.chatId))throw Error('找不到 Issue 任务对应的话题');
     const content=JSON.stringify({text:input.message.slice(0,3900)});
@@ -207,6 +213,7 @@ export class FeishuGateway {
     if (!this.client) throw new Error('飞书客户端尚未初始化');
     const group = this.projectGroups.get(projectPath);
     if (!group) throw new Error('找不到 Issue 任务对应的项目群');
+    if (!this.hasProjectGroup(projectPath)) throw new Error('项目群重复或已隔离');
     const topic = sessionId ? this.sessionTopics.get(sessionId) : undefined;
     const content = JSON.stringify({ text: message.slice(0, 3900) });
     const result = topic && topic.chatId === group.chatId
