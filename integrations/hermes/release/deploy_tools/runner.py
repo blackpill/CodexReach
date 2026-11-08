@@ -74,7 +74,7 @@ def main():
   return {'version_id':match.group(1)}
  def health(expected):
   # request() refuses redirects. Control-plane version was checked separately.
-  d=request('GET','https://classgames.net/__release.json?release='+rid,None,{'Cache-Control':'no-cache'})
+  d=request('GET','https://classgames.net/__release.json?release='+rid,None,{'Cache-Control':'no-cache','User-Agent':'ClassGamesReleaseHealth/1.0','Accept':'application/json'})
   from ..smoke import smoke
   return d=={'sha':expected} and smoke()
  result=run_release(root,sha,rid,run_id,ticket,public,claim,deploy,cf.snapshot,health,int(time.time()))
