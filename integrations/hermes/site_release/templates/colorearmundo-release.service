@@ -1,0 +1,22 @@
+[Unit]
+Description=colorearmundo isolated manual release (NOT INSTALLED)
+After=network-online.target
+[Service]
+User=colorearmundo-release
+Group=colorearmundo-release
+WorkingDirectory=/srv/hermes/release-control-colorearmundo/code
+Environment=SITE_RELEASE_PROJECT=colorearmundo
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=/etc/colorearmundo-release.env
+RuntimeDirectory=colorearmundo-release
+RuntimeDirectoryMode=0700
+UMask=0077
+ExecStart=/srv/hermes/release-control-colorearmundo/venv/bin/python -m integrations.hermes.site_release.runtime
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/hermes/release-control-colorearmundo/state /run/colorearmundo-release
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target

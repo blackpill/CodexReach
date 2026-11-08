@@ -1,0 +1,22 @@
+[Unit]
+Description=usmapgames isolated manual release (NOT INSTALLED)
+After=network-online.target
+[Service]
+User=usmapgames-release
+Group=usmapgames-release
+WorkingDirectory=/srv/hermes/release-control-usmapgames/code
+Environment=SITE_RELEASE_PROJECT=usmapgames
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=/etc/usmapgames-release.env
+RuntimeDirectory=usmapgames-release
+RuntimeDirectoryMode=0700
+UMask=0077
+ExecStart=/srv/hermes/release-control-usmapgames/venv/bin/python -m integrations.hermes.site_release.runtime
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/hermes/release-control-usmapgames/state /run/usmapgames-release
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
