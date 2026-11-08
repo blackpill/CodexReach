@@ -4,7 +4,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
  def redirect_request(self,*args,**kwargs):return None
 
 def request(method,url,data=None,headers=None):
- h={'Content-Type':'application/json',**(headers or {})}
+ h={'Content-Type':'application/json','User-Agent':'ClassGamesReleaseControl/1.0',**(headers or {})}
  req=urllib.request.Request(url,data=json.dumps(data).encode() if data is not None else None,headers=h,method=method)
  try:
   with urllib.request.build_opener(NoRedirect).open(req,timeout=20) as r:
