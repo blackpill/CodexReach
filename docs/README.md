@@ -1,6 +1,6 @@
 ---
-updated_at: 2026-11-08T19:15:53+08:00
-git_commit: 6d850b18e0e990ebb300eddc085d2a136aa5565e
+updated_at: 2026-11-08T19:25:08+08:00
+git_commit: 7dc1083831d221eb1f1a9da393f97a04d7885e8e
 ---
 
 # 文档索引
@@ -12,6 +12,7 @@ git_commit: 6d850b18e0e990ebb300eddc085d2a136aa5565e
 
 ## implement
 
+- [两站人工发布实施计划](implement/2026-11-08-two-site-manual-release-plan.md)
 - [2026-11-07-classgames-manual-release-plan](implement/2026-11-07-classgames-manual-release-plan.md)
 - [classgames-manual-release-pr-drafts](implement/classgames-manual-release-pr-drafts.md)
 - [classgames-manual-release](implement/classgames-manual-release.md)
