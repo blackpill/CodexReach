@@ -1,6 +1,6 @@
 ---
-updated_at: 2026-11-08T19:25:08+08:00
-git_commit: 7dc1083831d221eb1f1a9da393f97a04d7885e8e
+updated_at: 2026-11-08T20:11:02+08:00
+git_commit: dbd4043703714d78e35698d2e6e54daaf336371a
 ---
 
 # Two-site Manual Release Implementation Plan
@@ -55,10 +55,10 @@ git_commit: 7dc1083831d221eb1f1a9da393f97a04d7885e8e
 
 **Interfaces:** 产出上述 ABI 的 `ReleaseTarget`, `get_target`, `ReleaseConfig`, `load_config`, `production_config`；复用既有受审 Python 依赖版本与 hashes，不升级 classgames 依赖。
 
-- [ ] 检查/遵循每仓 AGENTS 与工作区状态；准备隔离 workspace，记录三个 base SHA；不覆盖正常检出。用 Node 22 与独立 hash-pinned Python venv 跑基线：控制器 `npm run test:all && npm run check:all && npm run build`；USMap `npm ci && npm run verify`（含所需 Playwright 浏览器）；Colorear `npm ci && npm test`。失败按测试名记录，先定位环境/既有失败，不删测试。
-- [ ] RED：`test_default_disabled_and_empty_allowlist`；`test_unknown_project_and_override_rejected`；`test_production_worker_is_preview_not_local_preview`；`test_configs_are_independent`。断言两 repo IDs、精确 domains/date/ASSETS/R2 与 Spec 相同，返回配置的修改不能影响其他调用/站。
-- [ ] 运行 `python -m unittest integrations.hermes.site_release.test_config -v`，确认因缺实现失败；实现 ABI，复跑至通过。
-- [ ] commit：`feat(release): register isolated site release targets`（只提交新增模块，不包含旧 v1 文件）。
+- [x] 检查/遵循每仓 AGENTS 与工作区状态；准备隔离 workspace，记录三个 base SHA；不覆盖正常检出。用 Node 22 与独立 hash-pinned Python venv 跑基线：控制器 `npm run test:all && npm run check:all && npm run build`；USMap `npm ci && npm run verify`（含所需 Playwright 浏览器）；Colorear `npm ci && npm test`。失败按测试名记录，先定位环境/既有失败，不删测试。
+- [x] RED：`test_default_disabled_and_empty_allowlist`；`test_unknown_project_and_override_rejected`；`test_production_worker_is_preview_not_local_preview`；`test_configs_are_independent`。断言两 repo IDs、精确 domains/date/ASSETS/R2 与 Spec 相同，返回配置的修改不能影响其他调用/站。
+- [x] 运行 `python -m unittest integrations.hermes.site_release.test_config -v`，确认因缺实现失败；实现 ABI，复跑至通过。
+- [x] commit：`feat(release): register isolated site release targets`（只提交新增模块，不包含旧 v1 文件）。
 
 ### Task 2: 状态、真人确认、签名与 OIDC
 
@@ -66,10 +66,10 @@ git_commit: 7dc1083831d221eb1f1a9da393f97a04d7885e8e
 
 **Interfaces:** `Store(path:Path,target:ReleaseTarget)` 提供与 v1 同义的 prepare/get/approve_for_dispatch/claim/transition/note/healthy_version/cancel/outbox 方法，所有读写校验目标；`verify_confirmation(message,manifest,config,now_ms)->{actor_id,message_id}`；`sign_ticket(approval,key)->str`；`verify_ticket(token,key,now,target)->dict`；`verify_github_oidc(token,expected,now,target,key_resolver=None)->dict`；`read_ticket_from_event(path)->str`。
 
-- [ ] RED：测试独立 DB、活动发布互斥、预约跨 reopen 持久化、同消息重放、错群/机器人/错租户/编辑撤回/精确文字/时间边界；取消仅 PREPARED，过期不自动延长。A/B 同 release_id 与篡改 manifest.project/repo/worker 必须在写入前拒绝。
-- [ ] RED：receipt 必须包含 schema/project/repository/repository_id/worker/environment/operation/release_id/target_sha/target_version/config_digest/expected_previous_version/approved_by/approved_at/expires_at；只允许 EdDSA 与 `typ=release+jwt`、90 分钟严格有效期。用两组本地临时 key 测试换站、换 key、未知/缺字段、错误类型/过期均失败。
-- [ ] RED：本地 RSA/JWKS fixture 验证官方 issuer + per-site audience + 固定 workflow_ref/main/GitHub-hosted/workflow_dispatch/attempt1 与匹配 run/SHA；key resolver 仅测试注入，不放宽生产校验。Event reader 大小/格式限制与遮罩回归保留。
-- [ ] 分别运行新增 unittest 模块看到失败，再实现并复跑；commit：`feat(release): bind approvals and claims to isolated sites`。
+- [x] RED：测试独立 DB、活动发布互斥、预约跨 reopen 持久化、同消息重放、错群/机器人/错租户/编辑撤回/精确文字/时间边界；取消仅 PREPARED，过期不自动延长。A/B 同 release_id 与篡改 manifest.project/repo/worker 必须在写入前拒绝。
+- [x] RED：receipt 必须包含 schema/project/repository/repository_id/worker/environment/operation/release_id/target_sha/target_version/config_digest/expected_previous_version/approved_by/approved_at/expires_at；只允许 EdDSA 与 `typ=release+jwt`、90 分钟严格有效期。用两组本地临时 key 测试换站、换 key、未知/缺字段、错误类型/过期均失败。
+- [x] RED：本地 RSA/JWKS fixture 验证官方 issuer + per-site audience + 固定 workflow_ref/main/GitHub-hosted/workflow_dispatch/attempt1 与匹配 run/SHA；key resolver 仅测试注入，不放宽生产校验。Event reader 大小/格式限制与遮罩回归保留。
+- [x] 分别运行新增 unittest 模块看到失败，再实现并复跑；commit：`feat(release): bind approvals and claims to isolated sites`。
 
 ### Task 3: 有界外部读取、基线与站点健康
 
@@ -77,10 +77,10 @@ git_commit: 7dc1083831d221eb1f1a9da393f97a04d7885e8e
 
 **Interfaces:** `request(method,url,data=None,headers=None)` 默认 UA `SiteReleaseControl/1.0`，无重定向、20 秒、有界 JSON、无写重试、脱敏异常；客户端构造均锁定 target；`verified_head(config,gh)->sha`、`prepare_manifest(config,gh,cf,now)->dict`、`check_baseline(manifest,gh,cf)`；`CloudflareReadClient.snapshot()->{version_id,deployment_id,source_sha,config_digest}`、`health(sha)->bool`；`smoke(target,fetch=None)->bool`。
 
-- [ ] RED wire：真实 loopback 收到默认/显式大小写 UA、Authorization/body；403/redirect/超时只请求一次，无 token/远端错误正文泄漏。App token body 固定该站 repository_ids，GitHub URL 不能跳到另一仓；只接受 App15368 的 verify + release-contracts 及成功 main push workflow（USMap issue-auto-ci.yml / Colorear verify.yml）。
-- [ ] RED CF fixture：真实调查形状的 ASSETS/R2/settings/domain/version；错 Worker/Zone、额外域名/绑定、换桶、分流、runtime/date 漂移均失败。分别保留 USMap html_handling 与 Colorear R2；normalize 仅去非配置动态字段，不忽略有安全意义的额外绑定。
-- [ ] RED health：marker project+SHA、canonical、robots 实际 sitemap（USMap `/sitemap.xml`、Colorear `/sitemap-index.xml`）、缺失404、www301。固定样本 USMap `/us-states-quiz/`、`/printables/blank-us-map-a4.pdf`；Colorear内容页及 `/media/pdfs/animales-para-colorear/buho-en-una-rama-a4.pdf`（路径由受审仓库文件和 Worker `/media/` 前缀导出，启用前必须再读线上验证）。PDF 有界前缀 `%PDF-`，不读取整个大文件。
-- [ ] 先测试失败再实现；first legacy SHA 未知只产生清单警告，不阻止新发布，也不制造 mapping。commit：`feat(release): verify per-site baselines and health`。
+- [x] RED wire：真实 loopback 收到默认/显式大小写 UA、Authorization/body；403/redirect/超时只请求一次，无 token/远端错误正文泄漏。App token body 固定该站 repository_ids，GitHub URL 不能跳到另一仓；只接受 App15368 的 verify + release-contracts 及成功 main push workflow（USMap issue-auto-ci.yml / Colorear verify.yml）。
+- [x] RED CF fixture：真实调查形状的 ASSETS/R2/settings/domain/version；错 Worker/Zone、额外域名/绑定、换桶、分流、runtime/date 漂移均失败。分别保留 USMap html_handling 与 Colorear R2；normalize 仅去非配置动态字段，不忽略有安全意义的额外绑定。
+- [x] RED health：marker project+SHA、canonical、robots 实际 sitemap（USMap `/sitemap.xml`、Colorear `/sitemap-index.xml`）、缺失404、www301。固定样本 USMap `/us-states-quiz/`、`/printables/blank-us-map-a4.pdf`；Colorear内容页及 `/media/pdfs/animales-para-colorear/buho-en-una-rama-a4.pdf`（路径由受审仓库文件和 Worker `/media/` 前缀导出，启用前必须再读线上验证）。PDF 有界前缀 `%PDF-`，不读取整个大文件。
+- [x] 先测试失败再实现；first legacy SHA 未知只产生清单警告，不阻止新发布，也不制造 mapping。commit：`feat(release): verify per-site baselines and health`。
 
 ### Task 4: 控制器、Native CLI、claim HTTP 与只读协调
 
@@ -88,10 +88,10 @@ git_commit: 7dc1083831d221eb1f1a9da393f97a04d7885e8e
 
 **Interfaces:** `Controller(config,store,gh,cf,feishu,private_key)` 暴露 prepare/prepare_rollback/locate/confirm；`ClaimService(...).claim(release_id,ticket,oidc_token,now)`；`approval_claims(row)->dict` 必须符合 Task2 receipt 字段；`reconcile(controller,rid,now=None)->row` 绝不派发。runtime 固定启动 project，template wrappers `usmapgames-release` / `colorearmundo-release` 固定 socket；仅输出模板，不安装。
 
-- [ ] RED：prepare 发完整目标/基线/未知警告/10分钟 nonce；通知不确定保留 durable row，不盲创建第二单。confirm 前任一开关/白名单/主干/基线不符均无 dispatch；真正真人确认只原子预约一次，204/timeout 转 uncertain 后只 locate/reconcile，禁止重发。
-- [ ] RED HTTP：公网仅精确 `/v1/claims`，初步 OIDC 拒绝、目标独立 audience、请求大小与 JSON shape、慢请求读超时/并发上限；不能在公网 prepare/approve/dispatch。cross-target HTTP/CLI payload 不写入另一 DB。
-- [ ] RED reconcile：匹配 project/repo/run/SHA/operation/claim 与控制面、双重健康后才 HEALTHY；missing result/未知结果保留待处理；通知有限重试不触发部署；未知旧 mapping 的 rollback 拒绝。
-- [ ] 实现与复跑；模板默认 disabled/empty allowlist、独立用户/key/env/socket/tunnel目录，说明安装另取授权。commit：`feat(release): add isolated native controller runtime`。
+- [x] RED：prepare 发完整目标/基线/未知警告/10分钟 nonce；通知不确定保留 durable row，不盲创建第二单。confirm 前任一开关/白名单/主干/基线不符均无 dispatch；真正真人确认只原子预约一次，204/timeout 转 uncertain 后只 locate/reconcile，禁止重发。
+- [x] RED HTTP：公网仅精确 `/v1/claims`，初步 OIDC 拒绝、目标独立 audience、请求大小与 JSON shape、慢请求读超时/并发上限；不能在公网 prepare/approve/dispatch。cross-target HTTP/CLI payload 不写入另一 DB。
+- [x] RED reconcile：匹配 project/repo/run/SHA/operation/claim 与控制面、双重健康后才 HEALTHY；missing result/未知结果保留待处理；通知有限重试不触发部署；未知旧 mapping 的 rollback 拒绝。
+- [x] 实现与复跑；模板默认 disabled/empty allowlist、独立用户/key/env/socket/tunnel目录，说明安装另取授权。commit：`feat(release): add isolated native controller runtime`。
 
 ### Task 5: 受信发布工具和跨站验包
 
@@ -99,10 +99,10 @@ git_commit: 7dc1083831d221eb1f1a9da393f97a04d7885e8e
 
 **Interfaces:** `verify_package(root:Path,sha:str,target:ReleaseTarget)->manifest`；`run_release(root,sha,release_id,run_id,ticket,public_key,claim,deploy,snapshot,health,now,target)->result`；runner env/输出遵循 ABI。独立 trusted Wrangler lockfile 可从旧受审版本机械复用，不修改 v1。
 
-- [ ] RED：精确 config/project/repo/sha/marker/config_digest/files 集合，symlink/traversal/额外文件/错误 R2/跨站包拒绝；receipt 与 artifact 不一致时没有 claim；claim denied/unknown 时没有 deploy；一次 publish 结果未知不重试。
-- [ ] RED entrypoint wire：执行真实 main 的 OIDC GET/claim POST/marker GET 回调，loopback fixture 验证实际 UA/auth/body；claim_url 必须精确等于 target.claim_url，不能只 startswith HTTPS/endswith claims。receipt 从 event 文件读，不取可展开回执 env。
-- [ ] RED：main 在生产开关非精确 true、未知 project、无匹配 public key、错误 run/attempt 或完整包不符时拒绝。publisher 只调用 trusted Wrangler `--config --no-bundle --strict`，无 shell/网站构建脚本；rollback 仅明确可信 version，不自动执行。
-- [ ] 实现至全部新测试和旧 v1 测试通过；commit：`feat(release): add site-bound trusted publish tools`。
+- [x] RED：精确 config/project/repo/sha/marker/config_digest/files 集合，symlink/traversal/额外文件/错误 R2/跨站包拒绝；receipt 与 artifact 不一致时没有 claim；claim denied/unknown 时没有 deploy；一次 publish 结果未知不重试。
+- [x] RED entrypoint wire：执行真实 main 的 OIDC GET/claim POST/marker GET 回调，loopback fixture 验证实际 UA/auth/body；claim_url 必须精确等于 target.claim_url，不能只 startswith HTTPS/endswith claims。receipt 从 event 文件读，不取可展开回执 env。
+- [x] RED：main 在生产开关非精确 true、未知 project、无匹配 public key、错误 run/attempt 或完整包不符时拒绝。publisher 只调用 trusted Wrangler `--config --no-bundle --strict`，无 shell/网站构建脚本；rollback 仅明确可信 version，不自动执行。
+- [x] 实现至全部新测试和旧 v1 测试通过；commit：`feat(release): add site-bound trusted publish tools`。
 
 ### Task 6: USMap 网站接入
 
@@ -110,10 +110,10 @@ git_commit: 7dc1083831d221eb1f1a9da393f97a04d7885e8e
 
 **Interfaces:** 产出 ABI 的 USMap manifest/marker/config；`npm run test:release` 为新增合同命令。生产 config 精确 Worker `usmapgames-preview`、根域单 route、date2026-11-03、ASSETS trailing-slash/404/run-first、不增 observability。
 
-- [ ] RED：package fixture 验摘要/拒绝坏路径跨站项目；Worker marker GET/HEAD no-store，既有 Workers.dev 重定向与 ASSETS 行为不变。CI合同验证 PR+main push、现有三个浏览器和 verify 依赖不削弱。
-- [ ] 实现 marker、生产打包与 immutable 校验、本地真实最终 Worker 冒烟（marker/canonical/headers/redirects/quiz/PDF/404；临时副本去 routes，原包不变）。不接生产 CF凭据。
-- [ ] 新工作流按 ABI：最先 mask；无 secret 构建；publish 的 production Environment/精确开关/main/concurrency/id-token；tool pin 初始空、发布前 guard 拒绝；工具 checkout/锁定依赖后 only runner；CF secret 只在 publish。Action SHA 使用现有受审 classgames 的固定版本，禁止引用可变 tags。
-- [ ] 跑 `npm run test:release && npm run verify`、真实最终包 smoke、trusted verifier 与 exact dry-run；用临时本地 key 做签名/包互认测试，不运行云 workflow。commit：`feat(release): prepare USMap manual production workflow`。
+- [x] RED：package fixture 验摘要/拒绝坏路径跨站项目；Worker marker GET/HEAD no-store，既有 Workers.dev 重定向与 ASSETS 行为不变。CI合同验证 PR+main push、现有三个浏览器和 verify 依赖不削弱。
+- [x] 实现 marker、生产打包与 immutable 校验、本地真实最终 Worker 冒烟（marker/canonical/headers/redirects/quiz/PDF/404；临时副本去 routes，原包不变）。不接生产 CF凭据。
+- [x] 新工作流按 ABI：最先 mask；无 secret 构建；publish 的 production Environment/精确开关/main/concurrency/id-token；tool pin 初始空、发布前 guard 拒绝；工具 checkout/锁定依赖后 only runner；CF secret 只在 publish。Action SHA 使用现有受审 classgames 的固定版本，禁止引用可变 tags。
+- [x] 跑 `npm run test:release && npm run verify`、真实最终包 smoke、trusted verifier 与 exact dry-run；用临时本地 key 做签名/包互认测试，不运行云 workflow。commit：`feat(release): prepare USMap manual production workflow`。
 
 ### Task 7: Colorear 网站接入与 R2 分支覆盖
 
@@ -121,25 +121,25 @@ git_commit: 7dc1083831d221eb1f1a9da393f97a04d7885e8e
 
 **Interfaces:** 同 ABI，project=`colorearmundo`，registry生产 config（date2026-07-29、两域名、ASSETS、固定 COLORING_ASSETS→colorearmundo-assets、原 observability）；`npm run test:release`。
 
-- [ ] RED：与 USMap 同一 canonical/hash/文件集合协议；Colorear精确 R2 binding；Worker marker 不破坏 canonical/www/security headers；本地 fixture 分别令 R2 get 命中/未命中，验证媒体头/正文与 static fallback。
-- [ ] 实现构建/打包/marker和workflow，保留 `verify.yml` 的 PR+main push/npm test 能力。所有构建/验证/publish步骤都不得运行 upload:r2 或资源生成/桶管理命令；模板不请求数据写权限。
-- [ ] 使用临时本地 R2 仿真 fixture 测试真实最终 Worker 命中和 fallback；真实桶不参与本地测试。跑 `npm test && npm run test:release`、final package smoke、trusted verifier/dry-run；验证包/签名换到 USMap 时拒绝。
-- [ ] commit：`feat(release): prepare Colorear manual production workflow`。
+- [x] RED：与 USMap 同一 canonical/hash/文件集合协议；Colorear精确 R2 binding；Worker marker 不破坏 canonical/www/security headers；本地 fixture 分别令 R2 get 命中/未命中，验证媒体头/正文与 static fallback。
+- [x] 实现构建/打包/marker和workflow，保留 `verify.yml` 的 PR+main push/npm test 能力。所有构建/验证/publish步骤都不得运行 upload:r2 或资源生成/桶管理命令；模板不请求数据写权限。
+- [x] 使用临时本地 R2 仿真 fixture 测试真实最终 Worker 命中和 fallback；真实桶不参与本地测试。跑 `npm test && npm run test:release`、final package smoke、trusted verifier/dry-run；验证包/签名换到 USMap 时拒绝。
+- [x] commit：`feat(release): prepare Colorear manual production workflow`。
 
 ### Task 8: 集成复核、独立审查与三个 PR
 
 **Files:** 三仓发布测试报告与 docs 索引；只纳入本次代码/文档与 lockfile 的必要变化。
 
-- [ ] 从两个网站实际 feature SHA 生成包，使用同一新 shared runner 分别验包；交叉 project/repo/key/OIDC/config/receipt 负向矩阵全部拒绝。复核 v1 路径与 classgames 源 pin/云资源零变更。
-- [ ] 重跑控制器 `npm run test:all && npm run check:all && npm run build`（匹配Node22及独立venv）；两网站上述全套、真包烟测与 dry-run。日志放 ignored scratch；失败按名称报告，不能把静态合同当正向云部署证据。
-- [ ] 按 Native 方法请求一位 fresh reviewer 做全分支审查（覆盖三仓相互协议、身份/密钥/项目隔离、CI门禁、R2边界），修复阻塞项并复测；不委派产品实现。
-- [ ] `git diff --check` 和范围检查后，仅 push 三个本次 codex 分支，使用 `gh pr create --draft` 创建：CodexReach 内核 PR、USMap PR、Colorear PR。不更改自动合并/生产设置，不派发工作流。
-- [ ] PR正文链接设计/计划和依赖；网站两 PR 明确“工具 pin 未定、不可合并部署，待内核审核合并后更新 merge SHA”；列明实测/未测、生产资源与身份另行授权、旧SHA未知与恢复限制。等各自 CI 完成；任何失败不删检查，调查或明确报告。
-- [ ] 最终返回三个真实 PR URL、验证结果、未验证的生产路径与下一授权步骤。阶段结果不是“已支持生产上线”，而是“离线实现及待审核 PR已交付”。
+- [x] 从两个网站实际 feature SHA 生成包，使用同一新 shared runner 分别验包；交叉 project/repo/key/OIDC/config/receipt 负向矩阵全部拒绝。复核 v1 路径与 classgames 源 pin/云资源零变更。
+- [x] 重跑控制器 `npm run test:all && npm run check:all && npm run build`（匹配Node22及独立venv）；两网站上述全套、真包烟测与 dry-run。日志放 ignored scratch；失败按名称报告，不能把静态合同当正向云部署证据。
+- [x] 按 Native 方法请求一位 fresh reviewer 做全分支审查（覆盖三仓相互协议、身份/密钥/项目隔离、CI门禁、R2边界），修复阻塞项并复测；不委派产品实现。
+- [x] `git diff --check` 和范围检查后，仅 push 三个本次 codex 分支，使用 `gh pr create --draft` 创建：CodexReach 内核 PR、USMap PR、Colorear PR。不更改自动合并/生产设置，不派发工作流。
+- [x] PR正文链接设计/计划和依赖；网站两 PR 明确“工具 pin 未定、不可合并部署，待内核审核合并后更新 merge SHA”；列明实测/未测、生产资源与身份另行授权、旧SHA未知与恢复限制。等各自 CI 完成；任何失败不删检查，调查或明确报告。
+- [x] 最终返回三个真实 PR URL、验证结果、未验证的生产路径与下一授权步骤。阶段结果不是“已支持生产上线”，而是“离线实现及待审核 PR已交付”。
 
 ## Plan self-review
 
 - Spec 第1–4节→Tasks1/2/4，协议第5节→Tasks2–5，网站/健康第6–7节→Tasks3/5/6/7，隔离失败场景第8节→Tasks2–8，交付/授权/排除项第9–10节→Global Constraints与Task8。
 - 所有 later-task 消费的 profile、manifest、marker、env、runner/result ABI 均在上文固定；不留跨仓签名/命名猜测。
 - Review Focus 五类风险各有明确 RED 测试；生产正向 OIDC/写入/回滚仍属本轮范围外，不能以 mock、dry-run 或模板声称验收。
-- 实施前需要用户核对本计划；方法已选 Native，无需再选择代理模式。批准后连续执行到三个 PR，只在破坏性操作、未授权安全敏感变更或无法可靠推进的冲突处停止。
+- 用户已批准本计划并以 Native 连续执行到三个 Draft PR；测试模块合并组织、USMap Node26/preview→production构建顺序等实际调整与证据见离线验证报告，未突破生产授权边界。

@@ -1,11 +1,11 @@
 ---
-updated_at: 2026-11-08T19:25:08+08:00
-git_commit: 7dc1083831d221eb1f1a9da393f97a04d7885e8e
+updated_at: 2026-11-08T20:11:02+08:00
+git_commit: dbd4043703714d78e35698d2e6e54daaf336371a
 ---
 
 # USMapGames / ColorearMundo：Native 人工发布接入设计
 
-状态：用户已批准本设计，并授权进入离线实现和提交三个待审核 PR；实施计划待核对。尚未开始产品代码实现或创建实施 PR。
+状态：设计和实施计划均已获用户批准；Native 离线实现及三个 Draft PR 已交付，当前待审核，生产未配置/启用。
 
 ## 1. 目标与授权边界
 
