@@ -23,7 +23,7 @@ def smoke(target,fetch=None,expected_sha=None):
   if status!=200 or mime!='text/html' or not re.search(r'<link[^>]*rel=["\x27]canonical["\x27][^>]*href=["\x27]'+re.escape(target.origin+'/')+r'["\x27]',text):return False
   if headers.get('x-content-type-options')!='nosniff' or not headers.get('content-security-policy'):return False
   status,raw,_,_=fetch('/robots.txt');text=raw.decode() if isinstance(raw,bytes) else raw
-  if status!=200 or target.origin+target.sitemap not in text or re.search(r'^Disallow:\s*/\s*$',text,re.M):return False
+  if status!=200 or target.origin+target.sitemap not in text or not robots_allows_root(text):return False
   status,location,_,_=fetch('@www')
   if status!=301 or location!=target.origin+'/':return False
   if fetch(target.sitemap)[0]!=200 or fetch('/__release_missing_probe__')[0]!=404:return False
@@ -40,3 +40,17 @@ def smoke(target,fetch=None,expected_sha=None):
   status,body,mime,_=fetch(pdf)
   return status==200 and mime=='application/pdf' and (body if isinstance(body,bytes) else body.encode()).startswith(b'%PDF-')
  except Exception:return False
+
+
+def robots_allows_root(text):
+ groups=[];agents=[];rules=[]
+ for raw in text.splitlines():
+  line=raw.split('#',1)[0].strip()
+  if ':' not in line:continue
+  key,value=line.split(':',1);key=key.strip().lower();value=value.strip()
+  if key=='user-agent':
+   if rules:groups.append((agents,rules));agents=[];rules=[]
+   agents.append(value.lower())
+  elif key in ('allow','disallow') and agents:rules.append((key,value))
+ groups.append((agents,rules));public=[r for a,rs in groups if '*' in a for r in rs]
+ return not any(k=='disallow' and v in ('/','/*') for k,v in public) or any(k=='allow' and v=='/' for k,v in public)

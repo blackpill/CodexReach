@@ -27,3 +27,9 @@ class SmokeTests(unittest.TestCase):
     if p==path:headers={k:v for k,v in headers.items() if k!=header}
     return status,body,mime,headers
    self.assertFalse(smoke(A,read,expected_sha='a'*40))
+ def test_specific_training_bot_block_does_not_block_public_search(self):
+  original=self.fetch(A)
+  def read(p):
+   if p=='/robots.txt':return 200,'User-agent: GPTBot\nDisallow: /\nUser-agent: *\nAllow: /\nSitemap: '+A.origin+A.sitemap,'text/plain',{}
+   return original(p)
+  self.assertTrue(smoke(A,read,expected_sha='a'*40))
