@@ -1,6 +1,6 @@
 ---
-updated_at: 2026-11-08T19:25:08+08:00
-git_commit: 7dc1083831d221eb1f1a9da393f97a04d7885e8e
+updated_at: 2026-11-08T20:08:44+08:00
+git_commit: 86d06c9e1eabd5e7fddc5e35eaf8b7d31a8e6b27
 ---
 
 # 文档索引
@@ -20,6 +20,7 @@ git_commit: 7dc1083831d221eb1f1a9da393f97a04d7885e8e
 
 ## test
 
+- [两站人工发布离线验证与授权边界](test/2026-11-08-two-site-release-offline.md)
 - [ClassGames PR交接和新基线验证](test/2026-11-08-classgames-release-pr-handoff.md)
 
 - [2026-11-07-classgames-manual-release-offline](test/2026-11-07-classgames-manual-release-offline.md)
