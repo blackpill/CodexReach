@@ -1,12 +1,13 @@
 ---
-updated_at: 2026-11-08T00:00:00+08:00
-git_commit: d8ecc6f42a8f96f3e1597943568a4ba49c2d68ed
+updated_at: 2026-11-08T19:15:53+08:00
+git_commit: 6d850b18e0e990ebb300eddc085d2a136aa5565e
 ---
 
 # 文档索引
 
 ## spec
 
+- [USMapGames / ColorearMundo 人工发布接入设计](spec/2026-11-08-two-site-manual-release-design.md)
 - [2026-11-07-hermes-manual-release-design](spec/2026-11-07-hermes-manual-release-design.md)
 
 ## implement
