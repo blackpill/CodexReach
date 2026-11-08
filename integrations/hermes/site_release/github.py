@@ -11,8 +11,11 @@ class GithubClient:
   if d.get('total_count',0)>100:raise ValueError('Check pagination exceeds limit')
   return d.get('check_runs',[])
  def verified_workflow(self,sha):
-  d=self._api('actions/workflows/'+self.target.ci_workflow+'/runs?head_sha='+sha+'&event=push&per_page=10')
-  return any(r.get('head_sha')==sha and r.get('event')=='push' and r.get('status')=='completed' and r.get('conclusion')=='success' and r.get('path')=='.github/workflows/'+self.target.ci_workflow for r in d.get('workflow_runs',[]))
+  for workflow in (self.target.ci_workflow,'release-contracts.yml'):
+   d=self._api('actions/workflows/'+workflow+'/runs?head_sha='+sha+'&event=push&per_page=10')
+   if not any(r.get('head_sha')==sha and r.get('head_branch')=='main' and r.get('event')=='push' and r.get('status')=='completed' and r.get('conclusion')=='success' and r.get('path')=='.github/workflows/'+workflow for r in d.get('workflow_runs',[])):return False
+  return True
+
  def dispatch(self,rid,sha,ticket):
   return self._api('actions/workflows/deploy-production.yml/dispatches','POST',{'ref':'main','inputs':{'release_id':rid,'target_sha':sha,'approval_ticket':ticket}})
  def run(self,run_id):
@@ -57,3 +60,26 @@ class GithubClient:
    if not isinstance(prs,list) or len(prs)>=100:raise ValueError('Incomplete PR associations')
    out.append({'sha':sha,'title':c['commit']['message'].splitlines()[0],'prs':sorted({p['number'] for p in prs if p.get('base',{}).get('repo',{}).get('id')==self.target.repository_id})})
   return out
+
+ def package_manifest(self,run_id):
+  import io,json,zipfile,urllib.request,urllib.error,urllib.parse
+  from .transport import NoRedirect
+  d=self._api(f'actions/runs/{int(run_id)}/artifacts?per_page=100')
+  if d.get('total_count',len(d.get('artifacts',[])))>100:raise ValueError('Incomplete artifacts')
+  items=[a for a in d.get('artifacts',[]) if a.get('name')==self.target.project+'-release-manifest' and not a.get('expired')]
+  if len(items)!=1 or items[0].get('size_in_bytes',0)>2000000:raise ValueError('Manifest artifact unavailable')
+  url=f'https://api.github.com/repos/{self.target.repository}/actions/artifacts/{int(items[0]["id"])}/zip'
+  req=urllib.request.Request(url,headers={'Authorization':'Bearer '+self.token,'User-Agent':'SiteReleaseControl/1.0'})
+  try:
+   with urllib.request.build_opener(NoRedirect).open(req,timeout=20):pass
+   raise ValueError('Expected artifact redirect')
+  except urllib.error.HTTPError as e:
+   if e.code!=302:e.close();raise ValueError('Manifest artifact unavailable') from None
+   location=e.headers.get('Location','');e.close()
+  u=urllib.parse.urlparse(location)
+  if u.scheme!='https' or not u.hostname or not u.hostname.endswith('.blob.core.windows.net') or u.username:raise ValueError('Unexpected artifact storage')
+  with urllib.request.build_opener(NoRedirect).open(location,timeout=20) as r:raw=r.read(2000001)
+  if len(raw)>2000000:raise ValueError('Manifest archive too large')
+  with zipfile.ZipFile(io.BytesIO(raw)) as z:
+   if z.namelist()!=['manifest.json'] or z.getinfo('manifest.json').file_size>4000000:raise ValueError('Unexpected manifest payload')
+   return json.loads(z.read('manifest.json'))

@@ -1,7 +1,7 @@
 import hashlib,json,os,re,subprocess,time
 from pathlib import Path
 from ..config import production_config,ReleaseConfig,get_target
-from ..manifest import digest
+from ..manifest import digest,verify_artifact_manifest,rollback_artifact_manifest
 from ..tickets import verify_ticket
 from ..event_input import read_ticket_from_event
 from ..cloudflare import CloudflareReadClient
@@ -14,7 +14,7 @@ def verify_package(root,sha,target):
  for p in root.rglob('*'):
   if p.is_symlink() or not (p.is_file() or p.is_dir()):raise ValueError('Unsafe artifact entry')
   if p.is_file():files[p.relative_to(root).as_posix()]=hashlib.sha256(p.read_bytes()).hexdigest()
- m=json.loads((root/'manifest.json').read_text());cfg=json.loads((root/'wrangler.json').read_text())
+ m=verify_artifact_manifest(json.loads((root/'manifest.json').read_text()),target,sha);cfg=json.loads((root/'wrangler.json').read_text())
  if cfg!=production_config(target) or m.get('schema')!=1 or m.get('sha')!=sha or m.get('config_digest')!=digest(cfg):raise ValueError('Package identity mismatch')
  if set(m)!={'schema','project','repository','repository_id','sha','config_digest','files'} or m['project']!=target.project or m['repository']!=target.repository or m['repository_id']!=target.repository_id:raise ValueError('Package scope mismatch')
  if set(files)!=set(m.get('files',{}))|{'manifest.json'}:raise ValueError('Package file set mismatch')
@@ -25,7 +25,7 @@ def verify_package(root,sha,target):
 
 def run_release(root,sha,release_id,run_id,ticket,public_key,claim,deploy,snapshot,health,now,target):
  a=verify_ticket(ticket,public_key,now,target)
- m=verify_package(root,sha,target) if a['operation']=='deploy' else {'config_digest':digest(production_config(target)),'sha':sha}
+ m=verify_package(root,sha,target) if a['operation']=='deploy' else rollback_artifact_manifest(target,sha,a['target_version'])
  if a['release_id']!=release_id or a['target_sha']!=sha or a['config_digest']!=m['config_digest']:raise ValueError('Receipt mismatch')
  result={'schema':1,'project':target.project,'repository_id':target.repository_id,'operation':a['operation'],'release_id':release_id,'run_id':str(run_id),'sha':sha,'artifact_digest':digest(m),'previous_version':a['expected_previous_version'],'version_id':None,'deployment_id':None,'deploy_status':'not_attempted','health_status':'not_checked'}
  # Claim or external uncertainty is never retried here.
@@ -80,7 +80,7 @@ def main():
   # request() refuses redirects. Control-plane version was checked separately.
   d=request('GET',target.origin+'/__release.json?release='+rid,None,{'Cache-Control':'no-cache','User-Agent':'SiteReleaseHealth/1.0','Accept':'application/json'})
   from ..smoke import smoke
-  return d=={'schema':1,'project':target.project,'sha':expected} and smoke(target)
+  return d=={'schema':1,'project':target.project,'sha':expected} and smoke(target,expected_sha=expected)
  result=run_release(root,sha,rid,run_id,ticket,public,claim,deploy,cf.snapshot,health,int(time.time()),target)
  Path(env['RELEASE_RESULT']).write_text(json.dumps(result,sort_keys=True)+'\n')
  if result['deploy_status']!='deployed' or result['health_status']!='healthy':raise SystemExit(1)

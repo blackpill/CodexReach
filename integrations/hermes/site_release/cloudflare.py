@@ -38,4 +38,4 @@ class CloudflareReadClient:
  def health(self,sha):
   d=self.transport('GET',self.config.origin+'/__release.json?sha='+sha,None,{'Cache-Control':'no-cache','User-Agent':'SiteReleaseHealth/1.0','Accept':'application/json'})
   from .smoke import smoke
-  return d=={'schema':1,'project':self.config.project,'sha':sha} and smoke(self.config.target)
+  return d=={'schema':1,'project':self.config.project,'sha':sha} and smoke(self.config.target,expected_sha=sha)

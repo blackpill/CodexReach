@@ -1,5 +1,5 @@
 """Read-only external reconciliation. This module cannot dispatch or deploy."""
-from .manifest import digest
+from .manifest import digest,verify_artifact_manifest,rollback_artifact_manifest
 
 def _reconcile(controller,rid):
  s=controller.store;r=s.get(rid);m=r['manifest']
@@ -14,12 +14,16 @@ def _reconcile(controller,rid):
  if run.get('status')!='completed':return r
  try:
   d=controller.gh.result(r['run_id'])
+  fields={'schema','project','repository_id','operation','release_id','run_id','sha','artifact_digest','previous_version','version_id','deployment_id','deploy_status','health_status'}
+  if set(d)!=fields or type(d.get('schema')) is not int or type(d.get('repository_id')) is not int:raise ValueError('Invalid result schema')
+  expected_manifest=verify_artifact_manifest(controller.gh.package_manifest(r['run_id']),controller.config.target,m['target_sha']) if m['operation']=='deploy' else rollback_artifact_manifest(controller.config.target,m['target_sha'],m['target_version'])
+  if d.get('artifact_digest')!=digest(expected_manifest) or (m['operation']=='rollback' and d.get('version_id')!=m['target_version']):raise ValueError('Result does not match approved artifact/version')
   if d.get('schema')!=1 or d.get('project')!=m['project'] or d.get('repository_id')!=m['repository_id'] or d.get('release_id')!=rid or str(d.get('run_id'))!=r['run_id'] or d.get('sha')!=m['target_sha'] or d.get('operation')!=m['operation'] or d.get('previous_version')!=m['expected_previous_version']:raise ValueError()
  except Exception:
   if r['state']=='DISPATCHED':return s.transition(rid,'DISPATCHED','VALIDATION_FAILED',{'result_error':True})
   if r['state']=='DEPLOYING':return s.transition(rid,'DEPLOYING','DEPLOY_UNCERTAIN',{'result_error':True})
   return r
- if d.get('deploy_status')!='deployed':
+ if run.get('conclusion')!='success' or d.get('deploy_status')!='deployed':
   if r['state']=='DEPLOYING':return s.transition(rid,'DEPLOYING','DEPLOY_UNCERTAIN',d)
   return r
  if not r['claimed']:raise ValueError('Deployment without claim')

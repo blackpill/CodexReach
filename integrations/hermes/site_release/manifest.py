@@ -23,3 +23,16 @@ def check_baseline(manifest,gh,cf):
  for key,remote in [('expected_previous_version','version_id'),('expected_previous_deployment','deployment_id'),('baseline_config_digest','config_digest')]:
   if manifest[key]!=s[remote]:raise ValueError('Production baseline changed; prepare again')
  if manifest['config_digest']!=digest(production_config(config.target)):raise ValueError('Release configuration changed')
+
+
+def rollback_artifact_manifest(target,sha,version):
+ return {'schema':1,'operation':'rollback','project':target.project,'repository':target.repository,'repository_id':target.repository_id,'sha':sha,'target_version':version,'config_digest':digest(production_config(target))}
+
+def verify_artifact_manifest(m,target,sha):
+ if not isinstance(m,dict) or set(m)!={'schema','project','repository','repository_id','sha','config_digest','files'}:raise ValueError('Invalid manifest schema')
+ if type(m['schema']) is not int or m['schema']!=1 or type(m['repository_id']) is not int or any(m[k]!=v for k,v in {'project':target.project,'repository':target.repository,'repository_id':target.repository_id,'sha':sha,'config_digest':digest(production_config(target))}.items()):raise ValueError('Manifest target mismatch')
+ files=m['files']
+ if not isinstance(files,dict) or not 3<=len(files)<=20000 or not {'bundle.mjs','wrangler.json','assets/__release.json'}<=set(files):raise ValueError('Invalid manifest files')
+ for p,h in files.items():
+  if not isinstance(p,str) or not re.fullmatch(r'(bundle\.mjs|wrangler\.json|assets/.+)',p) or any(x in ('','..','.') for x in p.split('/')) or '\\' in p or not isinstance(h,str) or not re.fullmatch('[0-9a-f]{64}',h):raise ValueError('Invalid manifest entry')
+ return m
