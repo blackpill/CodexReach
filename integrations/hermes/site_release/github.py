@@ -20,14 +20,14 @@ class GithubClient:
   return self._api('actions/runs/'+str(run_id))
  def locate_run(self,release_id):
   d=self._api('actions/workflows/deploy-production.yml/runs?event=workflow_dispatch&per_page=100')
-  matches=[r for r in d.get('workflow_runs',[]) if r.get('display_title')=='classgames-release-'+release_id]
+  matches=[r for r in d.get('workflow_runs',[]) if r.get('display_title')==self.target.project+'-release-'+release_id]
   if len(matches)!=1:raise ValueError('Dispatch not uniquely reconciled')
   return matches[0]
  def result(self,run_id):
   import io,json,zipfile,urllib.request,urllib.error,urllib.parse
   from .transport import NoRedirect
   data=self._api(f'actions/runs/{int(run_id)}/artifacts?per_page=100')
-  items=[x for x in data.get('artifacts',[]) if x.get('name')=='classgames-release-result' and not x.get('expired')]
+  items=[x for x in data.get('artifacts',[]) if x.get('name')==self.target.project+'-release-result' and not x.get('expired')]
   if len(items)!=1 or items[0].get('size_in_bytes',0)>200000:raise ValueError('Missing or oversized result artifact')
   aid=items[0]['id'];url=f'https://api.github.com/repos/{self.target.repository}/actions/artifacts/{int(aid)}/zip'
   req=urllib.request.Request(url,headers={'Authorization':'Bearer '+self.token})

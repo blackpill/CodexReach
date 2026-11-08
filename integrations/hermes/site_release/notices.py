@@ -9,7 +9,7 @@ def publish_status(controller,rid,now=None,attention=False):
  for row in pending:
   state=row['state']
   if not s.reserve_notice(rid,state,now):continue
-  uuid='notice_'+hashlib.sha256((rid+':'+state).encode()).hexdigest()[:32]
+  uuid='notice_'+hashlib.sha256((controller.config.project+':'+rid+':'+state).encode()).hexdigest()[:32]
   text=f"{controller.config.project} {rid}: {state}\n目标 SHA: {r['manifest']['target_sha']}\n"
   if state in ('DEPLOY_UNCERTAIN','DISPATCH_UNCERTAIN','RECONCILE_ATTENTION'):text+='结果需人工对账；不会自动重新部署。'
   sent=False

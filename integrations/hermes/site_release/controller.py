@@ -16,7 +16,7 @@ class Controller:
     text+='\n'+change['sha']+' '+change['title'][:160]+' PR '+','.join('#'+str(n) for n in change['prs'])
   if len(text.encode('utf-8'))>24000:raise ValueError('Change list too large; manual release review required')
   self.store.prepare(m)
-  try:mid=self.feishu.send_text(self.config.chat_id,text,m['release_id']);self.store.note(m['release_id'],{'notice_message_id':mid})
+  try:mid=self.feishu.send_text(self.config.chat_id,text,self.config.project+'_'+m['release_id']);self.store.note(m['release_id'],{'notice_message_id':mid})
   except Exception:self.store.note(m['release_id'],{'notice_error':True})
   return self.store.get(m['release_id'])
  def prepare(self,now):

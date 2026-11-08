@@ -2,6 +2,11 @@ import urllib.request,urllib.error,re
 from .transport import NoRedirect
 
 def probe(target,path):
+ if path=='@www':
+  req=urllib.request.Request('https://www.'+target.project+'.com/',headers={'User-Agent':'SiteReleaseHealth/1.0'})
+  try:r=urllib.request.build_opener(NoRedirect).open(req,timeout=15)
+  except urllib.error.HTTPError as e:r=e
+  with r:return r.status,r.headers.get('Location',''),'redirect'
  if not path.startswith('/') or path.startswith('//'):raise ValueError('Same-origin path required')
  req=urllib.request.Request(target.origin+path,headers={'Cache-Control':'no-cache','User-Agent':'SiteReleaseHealth/1.0'})
  try:r=urllib.request.build_opener(NoRedirect).open(req,timeout=15)
@@ -15,9 +20,11 @@ def smoke(target,fetch=None):
  fetch=fetch or (lambda p:probe(target,p))
  try:
   status,raw,mime=fetch('/');text=raw.decode() if isinstance(raw,bytes) else raw
-  if status!=200 or mime!='text/html' or target.origin+'/' not in text or not re.search(r'rel=["\x27]canonical["\x27]',text):return False
+  if status!=200 or mime!='text/html' or not re.search(r'<link[^>]*rel=["\x27]canonical["\x27][^>]*href=["\x27]'+re.escape(target.origin+'/')+r'["\x27]',text):return False
   status,raw,_=fetch('/robots.txt');text=raw.decode() if isinstance(raw,bytes) else raw
   if status!=200 or target.origin+target.sitemap not in text or re.search(r'^Disallow:\s*/\s*$',text,re.M):return False
+  status,location,_=fetch('@www')
+  if status!=301 or location!=target.origin+'/':return False
   if fetch(target.sitemap)[0]!=200 or fetch('/__release_missing_probe__')[0]!=404:return False
   if target.project=='usmapgames':
    if fetch('/us-states-quiz/')[0]!=200:return False
