@@ -34,7 +34,7 @@ def dispatch(c,d):
  if cmd=='locate-confirmation':return c.locate(rid)
  if cmd=='status':return c.store.get(rid)
  if cmd=='cancel':return c.store.cancel(rid)
- if cmd=='reconcile':return reconcile(c,rid)
+ if cmd=='reconcile':return reconcile(c,rid,recover_confirmed=True)
  raise ValueError('Invalid command')
 
 def main():
