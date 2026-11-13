@@ -1,6 +1,6 @@
 """Bounded persistent notification outbox, independent from deployment attempts."""
 import hashlib,time
-MEANINGFUL={'DISPATCHED','DISPATCH_UNCERTAIN','DEPLOYING','DEPLOYED','VALIDATION_FAILED','DEPLOY_UNCERTAIN','HEALTHY','DEPLOYED_UNHEALTHY'}
+MEANINGFUL={'DISPATCHED','DISPATCH_UNCERTAIN','DEPLOYING','DEPLOYED','VALIDATION_FAILED','DEPLOY_UNCERTAIN','HEALTHY','DEPLOYED_UNHEALTHY','RECONCILED_HEALTHY'}
 def publish_status(controller,rid,now=None,attention=False):
  now=int(time.time()) if now is None else now;s=controller.store;r=s.get(rid)
  if r['state'] in MEANINGFUL:s.queue_notice(rid,r['state'],now)
@@ -12,6 +12,7 @@ def publish_status(controller,rid,now=None,attention=False):
   uuid='notice_'+hashlib.sha256((controller.config.project+':'+rid+':'+state).encode()).hexdigest()[:32]
   text=f"{controller.config.project} {rid}: {state}\n目标 SHA: {r['manifest']['target_sha']}\n"
   if state in ('DEPLOY_UNCERTAIN','DISPATCH_UNCERTAIN','RECONCILE_ATTENTION'):text+='结果需人工对账；不会自动重新部署。'
+  if state=='RECONCILED_HEALTHY':text+='原工作流仍失败；已通过生产版本与现网健康复核对账结案，未重新部署。'
   sent=False
   try:controller.feishu.send_text(controller.config.chat_id,text,uuid);sent=True
   except Exception:pass
